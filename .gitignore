@@ -1,0 +1,7 @@
+# Scala CLI specific
+.scala-build/
+.target/
+.bsp
+
+# IDE
+.idea/
