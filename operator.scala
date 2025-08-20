@@ -1,16 +1,37 @@
 //> using scala 3.7.2
 //> using jvm 24
 
+//> using dep dev.hnaderi::scala-k8s-http4s::0.23.0
 //> using dep dev.hnaderi::scala-k8s-http4s-ember::0.23.0
+//> using dep dev.hnaderi::scala-k8s-circe::0.23.0
+//> using dep org.http4s::http4s-circe::0.23.30
 
+import cats.effect.IO
+import cats.effect.IOApp
+import dev.hnaderi.k8s.*
+import dev.hnaderi.k8s.circe.*
+import dev.hnaderi.k8s.client.http4s.EmberKubernetesClient
 import dev.hnaderi.k8s.client.APIGroupAPI
 import dev.hnaderi.k8s.utils.*
+import fs2.Stream
+import io.circe.Json
+import org.http4s.circe.*
 
-@main def main(): Unit = {}
+object OperatorApp extends IOApp.Simple {
+  def run: IO[Unit] =
+    val client = EmberKubernetesClient[IO].defaultConfig[Json]
+    Stream
+      .resource(client)
+      .flatMap(TorrentAPI().list.listen)
+      .evalMap(event => IO(println(event)))
+      .compile
+      .drain
+}
 
 case class TorrentSpec(
   infoHash: String
 )
+
 object TorrentSpec {
   given Encoder[TorrentSpec] = new Encoder[TorrentSpec] {
     def apply[T: Builder](o: TorrentSpec): T =
@@ -32,6 +53,7 @@ object TorrentSpec {
 case class Torrent(
   spec: TorrentSpec
 )
+
 object Torrent {
   given Encoder[Torrent] = new Encoder[Torrent] {
     def apply[T: Builder](o: Torrent): T =
@@ -57,16 +79,6 @@ case class TorrentList(
 )
 
 object TorrentList {
-  given Encoder[TorrentList] = new Encoder[TorrentList] {
-    def apply[T: Builder](o: TorrentList): T =
-      val obj = ObjectWriter[T]()
-      obj
-        .write("kind", "TorrentList")
-        .write("apiVersion", "torrent.TorrentDam.github.com/v1")
-        .write("items", o.items)
-        .build
-  }
-
   given Decoder[TorrentList] = new Decoder[TorrentList] {
     def apply[T: Reader](t: T): Either[String, TorrentList] =
       for
@@ -76,10 +88,13 @@ object TorrentList {
   }
 }
 
-object TorrentAPIGroup extends APIGroupAPI("/apis/torrent.TorrentDam.github.com/v1")
+object TorrentAPIGroup extends APIGroupAPI("/apis/torrentdam.github.com/v1")
 
-object TorrentResourceAPIs
-    extends TorrentAPIGroup.ClusterResourceAPI[
+object TorrentAPI
+    extends TorrentAPIGroup.NamespacedResourceAPI[
       Torrent,
       TorrentList
     ]("torrents")
+
+class TorrentAPI(val namespace: String = "default") extends TorrentAPI.NamespacedAPIBuilders
+object TorrentClusterAPI extends TorrentAPI.ClusterwideAPIBuilders

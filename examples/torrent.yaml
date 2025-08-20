@@ -1,0 +1,7 @@
+apiVersion: torrentdam.github.com/v1
+kind: Torrent
+metadata:
+  name: example-torrent
+  namespace: default
+spec:
+  infoHash: 0c59b70f18b8e40dc2c82bb4ea7418b51a9a3b43
