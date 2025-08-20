@@ -16,10 +16,13 @@ import dev.hnaderi.k8s.utils.*
 import fs2.Stream
 import io.circe.Json
 import org.http4s.circe.*
+import org.http4s.ember.client.EmberClientBuilder
+import scala.concurrent.duration.Duration
 
 object OperatorApp extends IOApp.Simple {
   def run: IO[Unit] =
-    val client = EmberKubernetesClient[IO].defaultConfig[Json]
+    val emberConfig = EmberClientBuilder.default[IO].withIdleConnectionTime(Duration.Inf)
+    val client = EmberKubernetesClient[IO](emberConfig).defaultConfig[Json]
     Stream
       .resource(client)
       .flatMap(TorrentAPI().list.listen)
