@@ -1,5 +1,5 @@
 //> using scala 3.7.2
-//> using jvm 24
+//> using jvm 21
 
 //> using dep dev.hnaderi::scala-k8s-http4s::0.23.0
 //> using dep dev.hnaderi::scala-k8s-http4s-ember::0.23.0
