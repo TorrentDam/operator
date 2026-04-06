@@ -8,15 +8,21 @@ spec:
   - name: v1
     schema:
       openAPIV3Schema:
-        type: object
-        properties:
-          spec:
-            type: object
-            required:
-            - infoHash
-            properties:
-              infoHash:
-                type: string
+         type: object
+         properties:
+           spec:
+             type: object
+             required:
+             - infoHash
+             - pvcName
+             - dhtNode
+             properties:
+               infoHash:
+                 type: string
+               pvcName:
+                 type: string
+               dhtNode:
+                 type: string
     served: true
     storage: true
   scope: Namespaced
