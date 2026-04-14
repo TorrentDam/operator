@@ -1,11 +1,7 @@
-Operator
-========
+# TorrentDam Operator
 
-Manages torrents in k8s cluster.
+Single-file Scala 3 Kubernetes operator for managing torrent downloads.
 
-Concept
--------
+Watches `Torrent` custom resources and creates/deletes pods accordingly. Exposes a JSON-based HTTP API inspired by [Transmission's RPC spec](https://github.com/transmission/transmission/blob/main/docs/rpc-spec.md) for torrent management.
 
-There is a custom resource called `Torrent`.
-_Operator_ watches for changes to `Torrent` and creates/deletes pods accordingly.
-_Operator_ exposes JSON-based API for clients to manage torrents. The API is copies [Transmission's RPC](https://github.com/transmission/transmission/blob/main/docs/rpc-spec.md). Not all methods are implemented. The goal is to support all methods required by [Radarr](https://github.com/Radarr/Radarr) and [Sonarr](https://github.com/Sonarr/Sonarr).
+Goal: Support all methods required by [Radarr](https://github.com/Radarr/Radarr) and [Sonarr](https://github.com/Sonarr/Sonarr).
