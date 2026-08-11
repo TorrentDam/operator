@@ -52,9 +52,8 @@ object OperatorApp extends IOApp.Simple:
     client.use(operatorLogic)
 
   def operatorLogic(client: KClient[IO]): IO[Unit] = async[IO]:
-    val podAPI = PodAPI("default")
     registerCustomResource(client).await
-    val operator = Operator(client, podAPI)
+    val operator = Operator(client)
     TorrentClusterAPI
       .list()
       .listen(client)
@@ -165,9 +164,11 @@ object TorrentAPI
 class TorrentAPI(val namespace: String = "default") extends TorrentAPI.NamespacedAPIBuilders
 object TorrentClusterAPI extends TorrentAPI.ClusterwideAPIBuilders
 
-class Operator(client: KClient[IO], podAPI: PodAPI):
+class Operator(client: KClient[IO]):
 
   def reconcile(resource: Torrent): IO[Unit] = async[IO]:
+    val namespace = resource.metadata.namespace.getOrElse("default")
+    val podAPI = PodAPI(namespace)
     val desired = getPod(resource)
     val currentPods = podAPI.list().send(client).await
     val currentPod = currentPods.items.find(pod => pod.metadata.exists(_.name == resource.metadata.name))
@@ -180,6 +181,8 @@ class Operator(client: KClient[IO], podAPI: PodAPI):
         IO.println("Created").await
 
   def delete(resource: Torrent): IO[Unit] = async[IO]:
+    val namespace = resource.metadata.namespace.getOrElse("default")
+    val podAPI = PodAPI(namespace)
     val pod = getPod(resource)
     for
       metadata <- pod.metadata
