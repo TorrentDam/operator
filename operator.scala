@@ -54,9 +54,10 @@ object OperatorApp extends IOApp.Simple:
   def operatorLogic(client: KClient[IO]): IO[Unit] = async[IO]:
     registerCustomResource(client).await
     val operator = Operator(client)
-    TorrentClusterAPI
-      .list()
-      .listen(client)
+    val events = sys.env.get("WATCH_NAMESPACE") match
+      case Some(namespace) => new TorrentAPI(namespace).list().listen(client)
+      case None            => TorrentClusterAPI.list().listen(client)
+    events
       .evalTap:
         case WatchEvent(WatchEventType.ADDED | WatchEventType.MODIFIED, torrent) =>
           operator.reconcile(torrent)

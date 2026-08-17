@@ -33,7 +33,7 @@ images:
     newTag: <sha-or-tag>
 ```
 
-> **Note:** The operator is currently hardcoded to run in the `default` namespace (it watches `Torrent` resources cluster-wide but manages pods in `default`). The `ClusterRoleBinding` subject reflects this.
+> **Note:** By default the operator watches the namespace it is deployed in (via the downward API `WATCH_NAMESPACE` env var). To watch cluster-wide, remove the env var from the Deployment.
 
 ### Creating a torrent
 
