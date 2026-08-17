@@ -15,6 +15,8 @@ FROM eclipse-temurin:25-jre
 
 WORKDIR /app
 
+ENV JDK_JAVA_OPTIONS="--add-exports java.base/jdk.internal.vm=ALL-UNNAMED"
+
 # Copy the built executable from builder
 COPY --from=builder /app/operator .
 
