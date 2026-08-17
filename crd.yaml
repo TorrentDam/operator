@@ -16,13 +16,16 @@ spec:
              - infoHash
              - pvcName
              - dhtNode
-             properties:
-               infoHash:
-                 type: string
-               pvcName:
-                 type: string
-               dhtNode:
-                 type: string
+              properties:
+                infoHash:
+                  type: string
+                pvcName:
+                  type: string
+                dhtNode:
+                  type: string
+                downloadPath:
+                  type: string
+                  default: /data
     served: true
     storage: true
   scope: Namespaced
