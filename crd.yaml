@@ -26,6 +26,7 @@ spec:
                 downloadPath:
                   type: string
                   default: /data
+                  description: Directory inside the PVC where torrent files are placed.
     served: true
     storage: true
   scope: Namespaced

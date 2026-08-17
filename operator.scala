@@ -224,7 +224,7 @@ class Operator(client: KClient[IO]):
             volumeMounts = Seq(
               VolumeMount(
                 name = "data",
-                mountPath = resource.spec.downloadPath
+                mountPath = "/data"
               )
             ).some,
             resources = ResourceRequirements(
