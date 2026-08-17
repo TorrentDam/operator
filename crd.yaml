@@ -23,10 +23,9 @@ spec:
                   type: string
                 dhtNode:
                   type: string
-                downloadPath:
-                  type: string
-                  default: ""
-                  description: Subdirectory inside the PVC where torrent files are placed. Empty means the PVC root.
+                 downloadPath:
+                   type: string
+                   description: Optional subdirectory inside the PVC where torrent files are placed. Defaults to the PVC root.
     served: true
     storage: true
   scope: Namespaced

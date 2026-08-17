@@ -86,7 +86,7 @@ case class TorrentSpec(
   infoHash: String,
   pvcName: String,
   dhtNode: String,
-  downloadPath: String = ""
+  downloadPath: Option[String] = None
 )
 
 object TorrentSpec {
@@ -97,7 +97,7 @@ object TorrentSpec {
         .write("infoHash", o.infoHash)
         .write("pvcName", o.pvcName)
         .write("dhtNode", o.dhtNode)
-        .write("downloadPath", Option(o.downloadPath).filter(_.nonEmpty))
+        .write("downloadPath", o.downloadPath)
         .build
   }
 
@@ -109,7 +109,7 @@ object TorrentSpec {
         pvcName <- obj.read[String]("pvcName")
         dhtNode <- obj.read[String]("dhtNode")
       yield
-        val downloadPath = obj.read[String]("downloadPath").toOption.getOrElse("")
+        val downloadPath = obj.read[String]("downloadPath").toOption
         TorrentSpec(infoHash, pvcName, dhtNode, downloadPath)
   }
 }
@@ -214,7 +214,7 @@ class Operator(client: KClient[IO]):
               "--dht-node",
               resource.spec.dhtNode
             ).some,
-            workingDir = (Path("/data") / resource.spec.downloadPath).toString.some,
+            workingDir = (Path("/data") / resource.spec.downloadPath.getOrElse("")).toString.some,
             env = Seq(
               EnvVar(
                 name = "INFO_HASH",
