@@ -7,7 +7,7 @@ spec:
   versions:
   - name: v1
     schema:
-      openAPIV3Schema:
+       openAPIV3Schema:
          type: object
          properties:
            spec:
@@ -16,16 +16,16 @@ spec:
              - infoHash
              - pvcName
              - dhtNode
-              properties:
-                infoHash:
-                  type: string
-                pvcName:
-                  type: string
-                dhtNode:
-                  type: string
-                 downloadPath:
-                   type: string
-                   description: Optional subdirectory inside the PVC where torrent files are placed. Defaults to the PVC root.
+             properties:
+               infoHash:
+                 type: string
+               pvcName:
+                 type: string
+               dhtNode:
+                 type: string
+               downloadPath:
+                 type: string
+                 description: Optional subdirectory inside the PVC where torrent files are placed. Defaults to the PVC root.
     served: true
     storage: true
   scope: Namespaced
