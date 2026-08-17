@@ -7,4 +7,4 @@ spec:
   infoHash: c8295ce630f2064f08440db1534e4992cfe4862a
   pvcName: movies
   dhtNode: dht.transmissionbt.com:6881
-  downloadPath: /data/movies
+  downloadPath: movies
