@@ -97,7 +97,7 @@ object TorrentSpec {
         .write("infoHash", o.infoHash)
         .write("pvcName", o.pvcName)
         .write("dhtNode", o.dhtNode)
-        .write("downloadPath", o.downloadPath)
+        .write("downloadPath", Option(o.downloadPath).filter(_.nonEmpty))
         .build
   }
 
