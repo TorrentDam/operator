@@ -9,7 +9,7 @@ COPY transmission.scala .
 COPY crd.yaml .
 
 # Build executable
-RUN scala --power package --assembly operator.scala --output operator
+RUN scala --power package --assembly operator.scala transmission.scala --output operator
 
 # Runtime stage
 FROM eclipse-temurin:25-jre
