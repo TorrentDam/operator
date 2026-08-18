@@ -16,7 +16,7 @@ import cats.syntax.all.given
 import cats.Eq
 import com.sun.tools.javac.util.Assert.error
 import dev.hnaderi.k8s.circe.*
-import dev.hnaderi.k8s.client.apis.corev1.PodAPI
+import dev.hnaderi.k8s.client.apis.corev1.{ClusterPodAPI, PodAPI}
 import dev.hnaderi.k8s.client.apis.api_extensions.CustomResourceAPI
 import dev.hnaderi.k8s.client.http4s.EmberKubernetesClient
 import dev.hnaderi.k8s.client.http4s.KClient
@@ -54,16 +54,21 @@ object OperatorApp extends IOApp.Simple:
   def operatorLogic(client: KClient[IO]): IO[Unit] = async[IO]:
     registerCustomResource(client).await
     val operator = Operator(client)
-    val events = sys.env.get("WATCH_NAMESPACE") match
-      case Some(namespace) => new TorrentAPI(namespace).list().listen(client)
-      case None            => TorrentClusterAPI.list().listen(client)
-    events
+    val namespace = sys.env.get("WATCH_NAMESPACE")
+    val torrentEvents = namespace match
+      case Some(ns) => new TorrentAPI(ns).list().listen(client)
+      case None    => TorrentClusterAPI.list().listen(client)
+    val podEvents = namespace match
+      case Some(ns) => PodAPI(ns).list().listen(client)
+      case None    => ClusterPodAPI.list().listen(client)
+    torrentEvents
       .evalTap:
         case WatchEvent(WatchEventType.ADDED | WatchEventType.MODIFIED, torrent) =>
           operator.reconcile(torrent)
         case WatchEvent(WatchEventType.DELETED, torrent) =>
           operator.delete(torrent)
         case _ => IO.unit
+      .merge(podEvents.evalTap(operator.onPodEvent))
       .compile
       .drain
       .await
@@ -205,7 +210,6 @@ class Operator(client: KClient[IO]):
     val namespace = resource.metadata.namespace.getOrElse("default")
     val name = resource.metadata.name.getOrElse("")
     val podAPI = PodAPI(namespace)
-    val torrentAPI = TorrentAPI(namespace)
     val desired = getPod(resource)
     val currentPods = podAPI.list().send(client).await
     val currentPod = currentPods.items.find(pod => pod.metadata.exists(_.name == Some(name)))
@@ -216,7 +220,7 @@ class Operator(client: KClient[IO]):
       case None =>
         podAPI.create(desired).send(client).await
         IO.println("Created").await
-    updateStatus(torrentAPI, podAPI, namespace, name).await
+    updateStatusByName(namespace, name).await
 
   def delete(resource: Torrent): IO[Unit] = async[IO]:
     val namespace = resource.metadata.namespace.getOrElse("default")
@@ -229,12 +233,19 @@ class Operator(client: KClient[IO]):
       podAPI.delete(name).send(client).void.await
       IO.println("Deleted").await
 
-  private def updateStatus(
-      torrentAPI: TorrentAPI,
-      podAPI: PodAPI,
-      namespace: String,
-      name: String
-  ): IO[Unit] = async[IO]:
+  def onPodEvent(event: WatchEvent[Pod]): IO[Unit] = event match
+    case WatchEvent(WatchEventType.ADDED | WatchEventType.MODIFIED, pod) =>
+      val isTorrentPod = pod.metadata.exists(_.labels.exists(_.get("app").contains("torrentdam")))
+      if isTorrentPod then
+        pod.metadata.flatMap(_.namespace).zip(pod.metadata.flatMap(_.name)) match
+          case Some((ns, name)) => updateStatusByName(ns, name).void
+          case None             => IO.unit
+      else IO.unit
+    case _ => IO.unit
+
+  private def updateStatusByName(namespace: String, name: String): IO[Unit] = async[IO]:
+    val podAPI = PodAPI(namespace)
+    val torrentAPI = TorrentAPI(namespace)
     val pod = podAPI.get(name).send(client).await
     val phase = pod.status.flatMap(_.phase).getOrElse("Unknown")
     val torrentStatus = TorrentStatus(phase = phase, podName = name.some)
@@ -246,7 +257,8 @@ class Operator(client: KClient[IO]):
     Pod(
       metadata = ObjectMeta(
         name = resource.metadata.name,
-        namespace = resource.metadata.namespace
+        namespace = resource.metadata.namespace,
+        labels = Map("app" -> "torrentdam").some
       ).some,
       spec = PodSpec(
         containers = Seq(
