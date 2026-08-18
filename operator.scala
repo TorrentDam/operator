@@ -155,7 +155,7 @@ object Torrent {
       val obj = ObjectWriter[T]()
       obj
         .write("kind", "Torrent")
-        .write("apiVersion", "torrent.TorrentDam.github.com/v1")
+        .write("apiVersion", "torrentdam.github.com/v1")
         .write("spec", o.spec)
         .write("metadata", o.metadata)
         .write("status", o.status)
