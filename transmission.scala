@@ -52,21 +52,31 @@ object TransmissionServer:
     Kleisli:
       case req @ POST -> Root / "transmission" / "rpc" =>
         val sessionId = req.headers.get(SessionHeader).map(_.head.value)
-        sessionId match
-          case None =>
-            Conflict(
-              Json.obj("result" -> Json.fromString("needs-session-id")),
-              Headers(Header.Raw(SessionHeader, UUID.randomUUID().toString))
-            )
-          case Some(_) =>
-            for
-              body <- req.as[Json]
-              result <- handleRpc(ops, body)
-              response <- Ok(result)
-            yield response
-      case GET -> Root / "transmission" / "rpc" =>
+        for
+          _ <- IO.println(s"[RPC] POST /transmission/rpc session-id=$sessionId headers=${req.headers.headers.map(h => s"${h.name}=${h.value}").mkString(", ")}")
+          resp <- sessionId match
+            case None =>
+              val sid = UUID.randomUUID().toString
+              IO.println(s"[RPC] No session-id, returning 409 with $sid") *>
+              Conflict(
+                Json.obj("result" -> Json.fromString("needs-session-id")),
+                Headers(Header.Raw(SessionHeader, sid))
+              )
+            case Some(_) =>
+              for
+                body <- req.as[Json]
+                _ <- IO.println(s"[RPC] Body: ${body.noSpaces}")
+                result <- handleRpc(ops, body)
+                _ <- IO.println(s"[RPC] Result: ${result.noSpaces}")
+                response <- Ok(result)
+              yield response
+        yield resp
+      case req @ GET -> Root / "transmission" / "rpc" =>
+        IO.println(s"[RPC] GET /transmission/rpc") *>
         Ok(Json.obj("result" -> Json.fromString("success")))
-      case _ => NotFound()
+      case req @ _ =>
+        IO.println(s"[RPC] Unmatched: ${req.method} ${req.uri}") *>
+        NotFound()
 
   def handleRpc(ops: TorrentOps[IO], body: Json): IO[Json] =
     val method = body.hcursor.get[String]("method").getOrElse("")
