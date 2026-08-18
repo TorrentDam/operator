@@ -53,7 +53,7 @@ object TransmissionServer:
       case req @ POST -> Root / "transmission" / "rpc" =>
         val sessionId = req.headers.get(SessionHeader).map(_.head.value)
         for
-          _ <- IO.println(s"[RPC] POST /transmission/rpc session-id=$sessionId headers=${req.headers.headers.map(h => s"${h.name}=${h.value}").mkString(", ")}")
+          _ <- IO.println(s"[RPC] POST /transmission/rpc session-id=$sessionId")
           resp <- sessionId match
             case None =>
               val sid = UUID.randomUUID().toString
@@ -72,8 +72,12 @@ object TransmissionServer:
               yield response
         yield resp
       case req @ GET -> Root / "transmission" / "rpc" =>
-        IO.println(s"[RPC] GET /transmission/rpc") *>
-        Ok(Json.obj("result" -> Json.fromString("success")))
+        val sid = UUID.randomUUID().toString
+        IO.println(s"[RPC] GET /transmission/rpc, returning 409 with $sid") *>
+        Conflict(
+          Json.obj("result" -> Json.fromString("needs-session-id")),
+          Headers(Header.Raw(SessionHeader, sid))
+        )
       case req @ _ =>
         IO.println(s"[RPC] Unmatched: ${req.method} ${req.uri}") *>
         NotFound()
