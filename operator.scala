@@ -343,10 +343,18 @@ object OperatorTorrentOps:
             namespace = namespace.some
           )
         )
-        new TorrentAPI(namespace).create(torrent).send(client).await
-        IO.println(s"Torrent created via API: $name").await
+        try
+          new TorrentAPI(namespace).create(torrent).send(client).await
+          IO.println(s"Torrent created via API: $name").await
+        catch
+          case ErrorResponse(error = ErrorStatus.Conflict) =>
+            IO.println(s"Torrent already exists: $name").await
 
       def delete(infoHash: String): IO[Unit] = async[IO]:
         val name = infoHash.toLowerCase
-        new TorrentAPI(namespace).delete(name).send(client).void.await
-        IO.println(s"Torrent deleted via API: $name").await
+        try
+          new TorrentAPI(namespace).delete(name).send(client).void.await
+          IO.println(s"Torrent deleted via API: $name").await
+        catch
+          case ErrorResponse(error = ErrorStatus.NotFound) =>
+            IO.println(s"Torrent not found for deletion: $name").await
