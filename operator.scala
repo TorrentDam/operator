@@ -2,10 +2,10 @@
 //> using jvm 21
 //> using javaOpt --add-exports java.base/jdk.internal.vm=ALL-UNNAMED
 
-//> using dep dev.hnaderi::scala-k8s-http4s::0.27.0
-//> using dep dev.hnaderi::scala-k8s-http4s-ember::0.27.0
-//> using dep dev.hnaderi::scala-k8s-circe::0.27.0
-//> using dep org.http4s::http4s-circe::0.23.33
+//> using dep dev.hnaderi::scala-k8s-http4s::0.31.0
+//> using dep dev.hnaderi::scala-k8s-http4s-ember::0.31.0
+//> using dep dev.hnaderi::scala-k8s-circe::0.31.0
+//> using dep org.http4s::http4s-circe::0.23.36
 //> using dep org.typelevel::cats-effect::3.7.0
 //> using dep org.typelevel::cats-effect-direct::1.0.0
 
@@ -115,9 +115,36 @@ object TorrentSpec {
   }
 }
 
+case class TorrentStatus(
+  phase: String,
+  podName: Option[String] = None
+)
+
+object TorrentStatus {
+  given Encoder[TorrentStatus] = new Encoder[TorrentStatus] {
+    def apply[T: Builder](o: TorrentStatus): T =
+      val obj = ObjectWriter[T]()
+      obj
+        .write("phase", o.phase)
+        .write("podName", o.podName)
+        .build
+  }
+
+  given Decoder[TorrentStatus] = new Decoder[TorrentStatus] {
+    def apply[T: Reader](t: T): Either[String, TorrentStatus] =
+      for
+        obj <- ObjectReader(t)
+        phase <- obj.read[String]("phase")
+      yield
+        val podName = obj.read[String]("podName").toOption
+        TorrentStatus(phase, podName)
+  }
+}
+
 case class Torrent(
   spec: TorrentSpec,
-  metadata: ObjectMeta
+  metadata: ObjectMeta,
+  status: Option[TorrentStatus] = None
 )
 
 object Torrent {
@@ -131,6 +158,7 @@ object Torrent {
         .write("apiVersion", "torrent.TorrentDam.github.com/v1")
         .write("spec", o.spec)
         .write("metadata", o.metadata)
+        .write("status", o.status)
         .build
   }
 
@@ -140,7 +168,9 @@ object Torrent {
         obj <- ObjectReader(t)
         spec <- obj.read[TorrentSpec]("spec")
         metadata <- obj.read[ObjectMeta]("metadata")
-      yield Torrent(spec, metadata)
+      yield
+        val status = obj.read[TorrentStatus]("status").toOption
+        Torrent(spec, metadata, status)
   }
 }
 
@@ -173,17 +203,20 @@ class Operator(client: KClient[IO]):
 
   def reconcile(resource: Torrent): IO[Unit] = async[IO]:
     val namespace = resource.metadata.namespace.getOrElse("default")
+    val name = resource.metadata.name.getOrElse("")
     val podAPI = PodAPI(namespace)
+    val torrentAPI = TorrentAPI(namespace)
     val desired = getPod(resource)
     val currentPods = podAPI.list().send(client).await
-    val currentPod = currentPods.items.find(pod => pod.metadata.exists(_.name == resource.metadata.name))
+    val currentPod = currentPods.items.find(pod => pod.metadata.exists(_.name == Some(name)))
     currentPod match
       case Some(current) =>
-        podAPI.replace(desired.metadata.get.name.get, desired)
+        podAPI.replace(name, desired)
         IO.println(s"Replaced").await
       case None =>
         podAPI.create(desired).send(client).await
         IO.println("Created").await
+    updateStatus(torrentAPI, podAPI, namespace, name).await
 
   def delete(resource: Torrent): IO[Unit] = async[IO]:
     val namespace = resource.metadata.namespace.getOrElse("default")
@@ -195,6 +228,19 @@ class Operator(client: KClient[IO]):
     do
       podAPI.delete(name).send(client).void.await
       IO.println("Deleted").await
+
+  private def updateStatus(
+      torrentAPI: TorrentAPI,
+      podAPI: PodAPI,
+      namespace: String,
+      name: String
+  ): IO[Unit] = async[IO]:
+    val pod = podAPI.get(name).send(client).await
+    val phase = pod.status.flatMap(_.phase).getOrElse("Unknown")
+    val torrentStatus = TorrentStatus(phase = phase, podName = name.some)
+    val current = torrentAPI.get(name).send(client).await
+    torrentAPI.replaceStatus(name, current.copy(status = torrentStatus.some)).send(client).void.await
+    IO.println(s"Status updated: $phase").await
 
   private def getPod(resource: Torrent): Pod =
     Pod(

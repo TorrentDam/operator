@@ -26,6 +26,15 @@ spec:
                downloadPath:
                  type: string
                  description: Optional subdirectory inside the PVC where torrent files are placed. Defaults to the PVC root.
+           status:
+             type: object
+             properties:
+               phase:
+                 type: string
+               podName:
+                 type: string
+    subresources:
+      status: {}
     served: true
     storage: true
   scope: Namespaced
