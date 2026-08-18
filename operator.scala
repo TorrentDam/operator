@@ -248,15 +248,24 @@ class Operator(client: KClient[IO]):
       else IO.unit
     case _ => IO.unit
 
-  private def updateStatusByName(namespace: String, name: String): IO[Unit] = async[IO]:
-    val podAPI = PodAPI(namespace)
-    val torrentAPI = TorrentAPI(namespace)
-    val pod = podAPI.get(name).send(client).await
-    val phase = pod.status.flatMap(_.phase).getOrElse("Unknown")
-    val torrentStatus = TorrentStatus(phase = phase, podName = name.some)
-    val current = torrentAPI.get(name).send(client).await
-    torrentAPI.replaceStatus(name, current.copy(status = torrentStatus.some)).send(client).void.await
-    IO.println(s"Status updated: $phase").await
+  private def updateStatusByName(namespace: String, name: String): IO[Unit] =
+    async[IO]:
+      val podAPI = PodAPI(namespace)
+      val torrentAPI = TorrentAPI(namespace)
+      val phase =
+        try
+          val pod = podAPI.get(name).send(client).await
+          pod.status.flatMap(_.phase).getOrElse("Unknown")
+        catch
+          case ErrorResponse(error = ErrorStatus.NotFound) => "Unknown"
+      val torrentStatus = TorrentStatus(phase = phase, podName = name.some)
+      try
+        val current = torrentAPI.get(name).send(client).await
+        torrentAPI.replaceStatus(name, current.copy(status = torrentStatus.some)).send(client).void.await
+        IO.println(s"Status updated: $phase").await
+      catch
+        case ErrorResponse(error = ErrorStatus.NotFound) =>
+          IO.println(s"Torrent not found, skipping status update: $name").await
 
   private def getPod(resource: Torrent): Pod =
     Pod(
