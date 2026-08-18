@@ -6,8 +6,6 @@
 //> using dep dev.hnaderi::scala-k8s-http4s-ember::0.31.0
 //> using dep dev.hnaderi::scala-k8s-circe::0.31.0
 //> using dep org.http4s::http4s-circe::0.23.36
-//> using dep org.http4s::http4s-ember-server::0.23.36
-//> using dep org.http4s::http4s-dsl::0.23.36
 //> using dep org.typelevel::cats-effect::3.7.0
 //> using dep org.typelevel::cats-effect-direct::1.0.0
 
@@ -63,8 +61,6 @@ object OperatorApp extends IOApp.Simple:
     val podEvents = namespace match
       case Some(ns) => PodAPI(ns).list().listen(client)
       case None    => ClusterPodAPI.list().listen(client)
-    val ops = OperatorTorrentOps(client, namespace.getOrElse("default"))
-    val httpServer = TransmissionServer.stream(ops, 9091)
     torrentEvents
       .evalTap:
         case WatchEvent(WatchEventType.ADDED | WatchEventType.MODIFIED, torrent) =>
@@ -73,7 +69,6 @@ object OperatorApp extends IOApp.Simple:
           operator.delete(torrent)
         case _ => IO.unit
       .merge(podEvents.evalTap(operator.onPodEvent))
-      .merge(httpServer)
       .compile
       .drain
       .await
@@ -312,41 +307,3 @@ class Operator(client: KClient[IO]):
     )
 
 end Operator
-
-object OperatorTorrentOps:
-  def apply(client: KClient[IO], namespace: String): TorrentOps[IO] =
-    new TorrentOps[IO]:
-      def list: IO[List[TorrentInfo]] = async[IO]:
-        val torrents = new TorrentAPI(namespace).list().send(client).await
-        torrents.items.toList.map { t =>
-          TorrentInfo(
-            name = t.metadata.name.getOrElse(t.spec.infoHash),
-            infoHash = t.spec.infoHash,
-            phase = t.status.flatMap(_.phase).getOrElse("Unknown"),
-            downloadPath = t.spec.downloadPath
-          )
-        }
-
-      def create(infoHash: String, downloadPath: Option[String]): IO[Unit] = async[IO]:
-        val pvcName = sys.env.getOrElse("PVC_NAME", "movies")
-        val dhtNode = sys.env.getOrElse("DHT_NODE", "server.dht.svc.cluster.local:6881")
-        val name = infoHash.toLowerCase
-        val torrent = Torrent(
-          spec = TorrentSpec(
-            infoHash = infoHash,
-            pvcName = pvcName,
-            dhtNode = dhtNode,
-            downloadPath = downloadPath
-          ),
-          metadata = ObjectMeta(
-            name = name.some,
-            namespace = namespace.some
-          )
-        )
-        new TorrentAPI(namespace).create(torrent).send(client).await
-        IO.println(s"Torrent created via API: $name").await
-
-      def delete(infoHash: String): IO[Unit] = async[IO]:
-        val name = infoHash.toLowerCase
-        new TorrentAPI(namespace).delete(name).send(client).void.await
-        IO.println(s"Torrent deleted via API: $name").await

@@ -5,6 +5,7 @@ WORKDIR /app
 
 # Copy source files
 COPY operator.scala .
+COPY transmission.scala .
 COPY crd.yaml .
 
 # Build executable
