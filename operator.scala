@@ -261,6 +261,7 @@ class Operator(client: KClient[IO]):
         labels = Map("app" -> "torrentdam").some
       ).some,
       spec = PodSpec(
+        restartPolicy = "OnFailure".some,
         containers = Seq(
           Container(
             name = "torrentdam",
