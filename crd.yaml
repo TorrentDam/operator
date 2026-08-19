@@ -10,8 +10,8 @@ spec:
        openAPIV3Schema:
          type: object
          properties:
-           spec:
-             type: object
+            spec:
+              type: object
               required:
               - infoHash
               - pvcName
@@ -20,23 +20,28 @@ spec:
               properties:
                 infoHash:
                   type: string
+                  description: 40-character hex SHA1 info hash of the torrent, used by the downloader pod to fetch the torrent via DHT.
                 pvcName:
                   type: string
+                  description: Name of the PersistentVolumeClaim to mount into the downloader pod for storing downloaded files.
                 dhtNode:
                   type: string
+                  description: DHT bootstrap node address (host:port) the downloader pod uses to join the BitTorrent DHT network.
                 name:
                   type: string
                   description: Display name of the torrent, parsed from the magnet link dn parameter or info hash fallback.
                 downloadPath:
                   type: string
                   description: Optional subdirectory inside the PVC where torrent files are placed. Defaults to the PVC root.
-           status:
-             type: object
-             properties:
-               phase:
-                 type: string
-               podName:
-                 type: string
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  description: Current lifecycle phase of the torrent. One of Pending, Running, Succeeded, Failed, or Unknown.
+                podName:
+                  type: string
+                  description: Name of the downloader pod currently handling this torrent, if any.
     subresources:
       status: {}
     served: true
