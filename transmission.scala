@@ -171,8 +171,8 @@ object TransmissionServer:
         val clientDir = arguments.hcursor.get[String]("download-dir").toOption
           .filter(_.nonEmpty)
         val labels = arguments.hcursor.get[List[String]]("labels").getOrElse(Nil)
-        val downloadPath = clientDir.map(dir => s"$dir/$segment").getOrElse(segment)
-        ops.create(m.infoHash, name, Some(downloadPath), labels).as(
+        val downloadPath = clientDir.map(dir => s"$dir/$segment").getOrElse(s"/$segment")
+        ops.create(m.infoHash, segment, Some(downloadPath), labels).as(
           Json.obj(
             "result" -> Json.fromString("success"),
             "arguments" -> Json.obj(
