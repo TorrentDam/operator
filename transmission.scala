@@ -103,7 +103,7 @@ object TransmissionServer:
         "rpc-version" -> Json.fromInt(15),
         "rpc-version-minimum" -> Json.fromInt(1),
         "version" -> Json.fromString("4.0.0 (TorrentDam)"),
-        "download-dir" -> Json.fromString("downloading"),
+        "download-dir" -> Json.fromString("/"),
         "seedRatioLimit" -> Json.fromDoubleOrNull(2.0),
         "seedRatioLimited" -> Json.fromBoolean(false),
         "idle-seeding-limit" -> Json.fromInt(30),
@@ -129,7 +129,7 @@ object TransmissionServer:
       "id" -> Json.fromInt(t.infoHash.hashCode),
       "hashString" -> Json.fromString(t.infoHash),
       "name" -> Json.fromString(t.name),
-      "downloadDir" -> Json.fromString(t.downloadPath.getOrElse("downloading")),
+      "downloadDir" -> Json.fromString("/" + t.downloadPath.getOrElse("")),
       "totalSize" -> Json.fromLong(1),
       "leftUntilDone" -> Json.fromLong(if isFinished then 0 else 1),
       "isFinished" -> Json.fromBoolean(isFinished),
@@ -167,7 +167,9 @@ object TransmissionServer:
           .map(_.toString)
           .filter(_.nonEmpty)
           .getOrElse(m.infoHash.toLowerCase)
-        val downloadPath = s"downloading/$segment"
+        val clientDir = arguments.hcursor.get[String]("download-dir").toOption
+          .filter(_.nonEmpty)
+        val downloadPath = clientDir.map(dir => s"$dir/$segment").getOrElse(segment)
         ops.create(m.infoHash, name, Some(downloadPath)).as(
           Json.obj(
             "result" -> Json.fromString("success"),
