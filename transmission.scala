@@ -126,11 +126,15 @@ object TransmissionServer:
 
   private def torrentToJson(t: TorrentInfo, fields: List[String]): Json =
     val isFinished = t.phase == "Succeeded"
+    val path = java.nio.file.Path.of(t.downloadPath.getOrElse("/"))
+    val downloadDir = Option(path.getParent).map(_.toString).filter(_.nonEmpty).getOrElse("/")
+    val downloadDirAbs = if (downloadDir.startsWith("/")) downloadDir else "/" + downloadDir
+    val name = Option(path.getFileName).map(_.toString).filter(_.nonEmpty).getOrElse(t.name)
     val all: Map[String, Json] = Map(
       "id" -> Json.fromInt(t.infoHash.hashCode),
       "hashString" -> Json.fromString(t.infoHash),
-      "name" -> Json.fromString(t.name),
-      "downloadDir" -> Json.fromString(t.downloadPath.getOrElse("/")),
+      "name" -> Json.fromString(name),
+      "downloadDir" -> Json.fromString(downloadDirAbs),
       "totalSize" -> Json.fromLong(1),
       "leftUntilDone" -> Json.fromLong(if isFinished then 0 else 1),
       "isFinished" -> Json.fromBoolean(isFinished),
