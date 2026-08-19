@@ -164,7 +164,7 @@ object TransmissionServer:
       case Some(m) =>
         val name = m.displayName.getOrElse(m.infoHash.toLowerCase)
         val segment = Option(java.nio.file.Path.of(name).getFileName)
-          .map(_.toString)
+          .map(_.toString.trim)
           .filter(_.nonEmpty)
           .getOrElse(m.infoHash.toLowerCase)
         val clientDir = arguments.hcursor.get[String]("download-dir").toOption

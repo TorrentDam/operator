@@ -19,6 +19,9 @@ import fs2.io.file.{Files, Path}
 import io.circe.Json
 import io.k8s.api.core.v1.Container
 import io.k8s.api.core.v1.EnvVar
+import io.k8s.api.core.v1.ExecAction
+import io.k8s.api.core.v1.Lifecycle
+import io.k8s.api.core.v1.LifecycleHandler
 import io.k8s.api.core.v1.PersistentVolumeClaimVolumeSource
 import io.k8s.api.core.v1.Pod
 import io.k8s.api.core.v1.PodSpec
@@ -265,6 +268,47 @@ class Operator(client: KClient[IO]):
     s"torrentdam-torrent-$prefix"
 
   private def getPod(resource: Torrent): Pod =
+    val downloadPath = resource.spec.downloadPath.getOrElse("")
+    val cleanupLifecycle: Option[Lifecycle] =
+      Option.when(downloadPath.nonEmpty) {
+        Lifecycle(
+          preStop = LifecycleHandler(
+            exec = ExecAction(command = Seq("rm", "-rf", s"/data/$downloadPath").some).some
+          ).some
+        )
+      }
+    val baseContainer = Container(
+      name = "torrentdam",
+      image = "ghcr.io/torrentdam/cmd:latest".some,
+      args = Seq(
+        "torrent",
+        "download",
+        "--info-hash",
+        resource.spec.infoHash,
+        "--dht-node",
+        resource.spec.dhtNode
+      ).some,
+      workingDir = (Path("/data") / downloadPath).toString.some,
+      env = Seq(
+        EnvVar(
+          name = "INFO_HASH",
+          value = resource.spec.infoHash.some
+        )
+      ).some,
+      volumeMounts = Seq(
+        VolumeMount(
+          name = "data",
+          mountPath = "/data"
+        )
+      ).some,
+      resources = ResourceRequirements(
+        requests = Map(
+          "cpu" -> Quantity("500m"),
+          "memory" -> Quantity("1Gi")
+        )
+      ).some
+    )
+    val container = cleanupLifecycle.fold(baseContainer)(baseContainer.withLifecycle)
     Pod(
       metadata = ObjectMeta(
         name = podNameFor(resource).some,
@@ -276,39 +320,8 @@ class Operator(client: KClient[IO]):
       ).some,
       spec = PodSpec(
         restartPolicy = "OnFailure".some,
-        containers = Seq(
-          Container(
-            name = "torrentdam",
-            image = "ghcr.io/torrentdam/cmd:latest".some,
-            args = Seq(
-              "torrent",
-              "download",
-              "--info-hash",
-              resource.spec.infoHash,
-              "--dht-node",
-              resource.spec.dhtNode
-            ).some,
-            workingDir = (Path("/data") / resource.spec.downloadPath.getOrElse("")).toString.some,
-            env = Seq(
-              EnvVar(
-                name = "INFO_HASH",
-                value = resource.spec.infoHash.some
-              )
-            ).some,
-            volumeMounts = Seq(
-              VolumeMount(
-                name = "data",
-                mountPath = "/data"
-              )
-            ).some,
-            resources = ResourceRequirements(
-              requests = Map(
-                "cpu" -> Quantity("500m"),
-                "memory" -> Quantity("1Gi")
-              )
-            ).some
-          )
-        ),
+        terminationGracePeriodSeconds = 300L.some,
+        containers = Seq(container),
         volumes = Seq(
           Volume(
             name = "data",
