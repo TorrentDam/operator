@@ -8,8 +8,11 @@ COPY operator.scala .
 COPY transmission.scala .
 COPY crd.yaml .
 
-# Build executable
-RUN scala --power package --assembly operator.scala transmission.scala --output operator
+# Build executable with Coursier cache mounted as build cache
+# This persists dependency downloads across builds without bloating layers
+RUN --mount=type=cache,target=/root/.cache/coursier \
+    --mount=type=cache,target=/root/.scala-build \
+    scala --power package --assembly operator.scala transmission.scala --output operator
 
 # Runtime stage
 FROM eclipse-temurin:25-jre
