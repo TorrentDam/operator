@@ -203,19 +203,20 @@ class Operator(client: KClient[IO]):
 
   def reconcile(resource: Torrent): IO[Unit] = async[IO]:
     val namespace = resource.metadata.namespace.getOrElse("default")
-    val name = resource.metadata.name.getOrElse("")
+    val crName = resource.metadata.name.getOrElse("")
+    val podName = podNameFor(resource)
     val podAPI = PodAPI(namespace)
     val desired = getPod(resource)
     val currentPods = podAPI.list().send(client).await
-    val currentPod = currentPods.items.find(pod => pod.metadata.exists(_.name == Some(name)))
+    val currentPod = currentPods.items.find(pod => pod.metadata.exists(_.name == Some(podName)))
     currentPod match
       case Some(current) =>
-        podAPI.replace(name, desired)
+        podAPI.replace(podName, desired)
         IO.println(s"Replaced").await
       case None =>
         podAPI.create(desired).send(client).await
         IO.println("Created").await
-    updateStatusByName(namespace, name).await
+    updateStatusByName(namespace, podName, crName).await
 
   def delete(resource: Torrent): IO[Unit] = async[IO]:
     val namespace = resource.metadata.namespace.getOrElse("default")
@@ -232,37 +233,46 @@ class Operator(client: KClient[IO]):
     case WatchEvent(WatchEventType.ADDED | WatchEventType.MODIFIED, pod) =>
       val isTorrentPod = pod.metadata.exists(_.labels.exists(_.get("app").contains("torrentdam")))
       if isTorrentPod then
-        pod.metadata.flatMap(_.namespace).zip(pod.metadata.flatMap(_.name)) match
-          case Some((ns, name)) => updateStatusByName(ns, name).void
-          case None             => IO.unit
+        val ns = pod.metadata.flatMap(_.namespace)
+        val podName = pod.metadata.flatMap(_.name)
+        val crName = pod.metadata.flatMap(_.labels).flatMap(_.get("torrent"))
+        (ns, podName, crName).mapN((n, p, c) => updateStatusByName(n, p, c).void)
+          .getOrElse(IO.unit)
       else IO.unit
     case _ => IO.unit
 
-  private def updateStatusByName(namespace: String, name: String): IO[Unit] =
+  private def updateStatusByName(namespace: String, podName: String, crName: String): IO[Unit] =
     async[IO]:
       val podAPI = PodAPI(namespace)
       val torrentAPI = TorrentAPI(namespace)
       val phase =
         try
-          val pod = podAPI.get(name).send(client).await
+          val pod = podAPI.get(podName).send(client).await
           pod.status.flatMap(_.phase).getOrElse("Unknown")
         catch
           case ErrorResponse(error = ErrorStatus.NotFound) => "Unknown"
-      val torrentStatus = TorrentStatus(phase = phase, podName = name.some)
+      val torrentStatus = TorrentStatus(phase = phase, podName = podName.some)
       try
-        val current = torrentAPI.get(name).send(client).await
-        torrentAPI.replaceStatus(name, current.copy(status = torrentStatus.some)).send(client).void.await
+        val current = torrentAPI.get(crName).send(client).await
+        torrentAPI.replaceStatus(crName, current.copy(status = torrentStatus.some)).send(client).void.await
         IO.println(s"Status updated: $phase").await
       catch
         case ErrorResponse(error = ErrorStatus.NotFound) =>
-          IO.println(s"Torrent not found, skipping status update: $name").await
+          IO.println(s"Torrent not found, skipping status update: $crName").await
+
+  private def podNameFor(resource: Torrent): String =
+    val prefix = resource.spec.infoHash.toLowerCase.take(10)
+    s"torrentdam-torrent-$prefix"
 
   private def getPod(resource: Torrent): Pod =
     Pod(
       metadata = ObjectMeta(
-        name = resource.metadata.name,
+        name = podNameFor(resource).some,
         namespace = resource.metadata.namespace,
-        labels = Map("app" -> "torrentdam").some
+        labels = Map(
+          "app" -> "torrentdam",
+          "torrent" -> resource.metadata.name.getOrElse("")
+        ).some
       ).some,
       spec = PodSpec(
         restartPolicy = "OnFailure".some,
