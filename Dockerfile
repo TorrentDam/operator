@@ -1,5 +1,5 @@
 # Build stage
-FROM sbtscala/scala-sbt:eclipse-temurin-24.0.1_9_1.12.8_3.8.3 AS builder
+FROM virtuslab/scala-cli:1.16.0 AS builder
 
 WORKDIR /app
 
