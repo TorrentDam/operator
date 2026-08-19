@@ -130,7 +130,7 @@ object TransmissionServer:
       "id" -> Json.fromInt(t.infoHash.hashCode),
       "hashString" -> Json.fromString(t.infoHash),
       "name" -> Json.fromString(t.name),
-      "downloadDir" -> Json.fromString("/" + t.downloadPath.getOrElse("")),
+      "downloadDir" -> Json.fromString(t.downloadPath.getOrElse("/")),
       "totalSize" -> Json.fromLong(1),
       "leftUntilDone" -> Json.fromLong(if isFinished then 0 else 1),
       "isFinished" -> Json.fromBoolean(isFinished),
