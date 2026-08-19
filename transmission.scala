@@ -27,8 +27,10 @@ case class TorrentInfo(
 
 trait TorrentOps[F[_]]:
   def list: F[List[TorrentInfo]]
-  def create(infoHash: String, downloadPath: Option[String]): F[Unit]
+  def create(infoHash: String, name: String, downloadPath: Option[String]): F[Unit]
   def delete(infoHash: String): F[Unit]
+
+case class MagnetInfo(infoHash: String, displayName: Option[String])
 
 object TransmissionServer:
 
@@ -104,7 +106,7 @@ object TransmissionServer:
         "rpc-version" -> Json.fromInt(15),
         "rpc-version-minimum" -> Json.fromInt(1),
         "version" -> Json.fromString("4.0.0 (TorrentDam)"),
-        "download-dir" -> Json.fromString("/data"),
+        "download-dir" -> Json.fromString("/data/downloading"),
         "seedRatioLimit" -> Json.fromDoubleOrNull(2.0),
         "seedRatioLimited" -> Json.fromBoolean(false),
         "idle-seeding-limit" -> Json.fromInt(30),
@@ -125,14 +127,15 @@ object TransmissionServer:
     }
 
   private def torrentToJson(t: TorrentInfo, fields: List[String]): Json =
+    val isFinished = t.phase == "Succeeded"
     val all: Map[String, Json] = Map(
       "id" -> Json.fromInt(t.infoHash.hashCode),
       "hashString" -> Json.fromString(t.infoHash),
       "name" -> Json.fromString(t.name),
-      "downloadDir" -> Json.fromString(s"/data/${t.downloadPath.getOrElse("")}"),
-      "totalSize" -> Json.fromLong(0),
-      "leftUntilDone" -> Json.fromLong(0),
-      "isFinished" -> Json.fromBoolean(t.phase == "Succeeded"),
+      "downloadDir" -> Json.fromString("/data/downloading"),
+      "totalSize" -> Json.fromLong(1),
+      "leftUntilDone" -> Json.fromLong(if isFinished then 0 else 1),
+      "isFinished" -> Json.fromBoolean(isFinished),
       "eta" -> Json.fromLong(-1),
       "status" -> Json.fromInt(phaseToStatus(t.phase)),
       "secondsDownloading" -> Json.fromLong(0),
@@ -160,34 +163,33 @@ object TransmissionServer:
 
   private def torrentAdd(ops: TorrentOps[IO], arguments: Json): IO[Json] =
     val filename = arguments.hcursor.get[String]("filename").getOrElse("")
-    val downloadDir = arguments.hcursor.get[String]("download-dir").toOption
-    val downloadPath = downloadDir.flatMap(extractDownloadPath)
-    parseInfoHash(filename) match
-      case Some(infoHash) =>
-        ops.create(infoHash, downloadPath).as(
+    parseMagnet(filename) match
+      case Some(m) =>
+        val name = m.displayName.getOrElse(m.infoHash.toLowerCase)
+        val downloadPath = s"downloading/$name"
+        ops.create(m.infoHash, name, Some(downloadPath)).as(
           Json.obj(
             "result" -> Json.fromString("success"),
             "arguments" -> Json.obj(
               "torrent-added" -> Json.obj(
-                "id" -> Json.fromInt(infoHash.hashCode),
-                "hashString" -> Json.fromString(infoHash),
-                "name" -> Json.fromString(infoHash.toLowerCase)
+                "id" -> Json.fromInt(m.infoHash.hashCode),
+                "hashString" -> Json.fromString(m.infoHash),
+                "name" -> Json.fromString(name)
               )
             )
           )
         )
       case None =>
-        IO.pure(Json.obj("result" -> Json.fromString("could not parse info hash from filename")))
+        IO.pure(Json.obj("result" -> Json.fromString("could not parse magnet URI")))
 
   private def torrentRemove(ops: TorrentOps[IO], arguments: Json): IO[Json] =
     val ids = arguments.hcursor.get[List[String]]("ids").getOrElse(Nil)
     ids.traverse(ops.delete).as(success)
 
-  private def extractDownloadPath(downloadDir: String): Option[String] =
-    downloadDir.stripPrefix("/data/").stripPrefix("/data") match
-      case "" => None
-      case path => Some(path)
-
-  private def parseInfoHash(magnetOrUrl: String): Option[String] =
-    val pattern = "xt=urn:btih:([a-fA-F0-9]{40})".r
-    pattern.findFirstMatchIn(magnetOrUrl).map(_.group(1).toUpperCase)
+  private def parseMagnet(magnet: String): Option[MagnetInfo] =
+    Uri.fromString(magnet).toOption.flatMap { uri =>
+      val infoHash = uri.query.params.get("xt")
+        .collect { case s"urn:btih:$hash" if hash.length == 40 => hash.toUpperCase }
+      val displayName = uri.query.params.get("dn")
+      infoHash.map(hash => MagnetInfo(hash, displayName))
+    }

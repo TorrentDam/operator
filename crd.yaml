@@ -12,20 +12,24 @@ spec:
          properties:
            spec:
              type: object
-             required:
-             - infoHash
-             - pvcName
-             - dhtNode
-             properties:
-               infoHash:
-                 type: string
-               pvcName:
-                 type: string
-               dhtNode:
-                 type: string
-               downloadPath:
-                 type: string
-                 description: Optional subdirectory inside the PVC where torrent files are placed. Defaults to the PVC root.
+              required:
+              - infoHash
+              - pvcName
+              - dhtNode
+              - name
+              properties:
+                infoHash:
+                  type: string
+                pvcName:
+                  type: string
+                dhtNode:
+                  type: string
+                name:
+                  type: string
+                  description: Display name of the torrent, parsed from the magnet link dn parameter or info hash fallback.
+                downloadPath:
+                  type: string
+                  description: Optional subdirectory inside the PVC where torrent files are placed. Defaults to the PVC root.
            status:
              type: object
              properties:

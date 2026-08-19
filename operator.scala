@@ -97,6 +97,7 @@ case class TorrentSpec(
   infoHash: String,
   pvcName: String,
   dhtNode: String,
+  name: String,
   downloadPath: Option[String] = None
 )
 
@@ -108,6 +109,7 @@ object TorrentSpec {
         .write("infoHash", o.infoHash)
         .write("pvcName", o.pvcName)
         .write("dhtNode", o.dhtNode)
+        .write("name", o.name)
         .write("downloadPath", o.downloadPath)
         .build
   }
@@ -119,9 +121,10 @@ object TorrentSpec {
         infoHash <- obj.read[String]("infoHash")
         pvcName <- obj.read[String]("pvcName")
         dhtNode <- obj.read[String]("dhtNode")
+        name <- obj.read[String]("name")
       yield
         val downloadPath = obj.read[String]("downloadPath").toOption
-        TorrentSpec(infoHash, pvcName, dhtNode, downloadPath)
+        TorrentSpec(infoHash, pvcName, dhtNode, name, downloadPath)
   }
 }
 
@@ -329,35 +332,36 @@ object OperatorTorrentOps:
         val torrents = new TorrentAPI(namespace).list().send(client).await
         torrents.items.toList.map { t =>
           TorrentInfo(
-            name = t.metadata.name.getOrElse(t.spec.infoHash),
+            name = t.spec.name,
             infoHash = t.spec.infoHash,
             phase = t.status.flatMap(_.phase).getOrElse("Unknown"),
             downloadPath = t.spec.downloadPath
           )
         }
 
-      def create(infoHash: String, downloadPath: Option[String]): IO[Unit] = async[IO]:
+      def create(infoHash: String, name: String, downloadPath: Option[String]): IO[Unit] = async[IO]:
         val pvcName = sys.env.getOrElse("PVC_NAME", "movies")
         val dhtNode = sys.env.getOrElse("DHT_NODE", "server.dht.svc.cluster.local:6881")
-        val name = infoHash.toLowerCase
+        val crName = infoHash.toLowerCase
         val torrent = Torrent(
           spec = TorrentSpec(
             infoHash = infoHash,
             pvcName = pvcName,
             dhtNode = dhtNode,
+            name = name,
             downloadPath = downloadPath
           ),
           metadata = ObjectMeta(
-            name = name.some,
+            name = crName.some,
             namespace = namespace.some
           )
         )
         try
           new TorrentAPI(namespace).create(torrent).send(client).await
-          IO.println(s"Torrent created via API: $name").await
+          IO.println(s"Torrent created via API: $crName").await
         catch
           case ErrorResponse(error = ErrorStatus.Conflict) =>
-            IO.println(s"Torrent already exists: $name").await
+            IO.println(s"Torrent already exists: $crName").await
 
       def delete(infoHash: String): IO[Unit] = async[IO]:
         val name = infoHash.toLowerCase
