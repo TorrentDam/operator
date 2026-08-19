@@ -88,7 +88,8 @@ case class TorrentSpec(
   pvcName: String,
   dhtNode: String,
   name: String,
-  downloadPath: Option[String] = None
+  downloadPath: Option[String] = None,
+  labels: List[String] = Nil
 )
 
 object TorrentSpec {
@@ -101,6 +102,7 @@ object TorrentSpec {
         .write("dhtNode", o.dhtNode)
         .write("name", o.name)
         .write("downloadPath", o.downloadPath)
+        .write("labels", o.labels)
         .build
   }
 
@@ -114,7 +116,8 @@ object TorrentSpec {
         name <- obj.read[String]("name")
       yield
         val downloadPath = obj.read[String]("downloadPath").toOption
-        TorrentSpec(infoHash, pvcName, dhtNode, name, downloadPath)
+        val labels = obj.read[Seq[String]]("labels").toOption.getOrElse(Nil).toList
+        TorrentSpec(infoHash, pvcName, dhtNode, name, downloadPath, labels)
   }
 }
 
@@ -345,11 +348,12 @@ object OperatorTorrentOps:
             name = t.spec.name,
             infoHash = t.spec.infoHash,
             phase = t.status.flatMap(_.phase).getOrElse("Unknown"),
-            downloadPath = t.spec.downloadPath
+            downloadPath = t.spec.downloadPath,
+            labels = t.spec.labels
           )
         }
 
-      def create(infoHash: String, name: String, downloadPath: Option[String]): IO[Unit] = async[IO]:
+      def create(infoHash: String, name: String, downloadPath: Option[String], labels: List[String]): IO[Unit] = async[IO]:
         val pvcName = sys.env.getOrElse("PVC_NAME", "movies")
         val dhtNode = sys.env.getOrElse("DHT_NODE", "server.dht.svc.cluster.local:6881")
         val crName = infoHash.toLowerCase
@@ -359,7 +363,8 @@ object OperatorTorrentOps:
             pvcName = pvcName,
             dhtNode = dhtNode,
             name = name,
-            downloadPath = downloadPath
+            downloadPath = downloadPath,
+            labels = labels
           ),
           metadata = ObjectMeta(
             name = crName.some,

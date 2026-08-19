@@ -33,6 +33,11 @@ spec:
                 downloadPath:
                   type: string
                   description: Optional subdirectory inside the PVC where torrent files are placed. Defaults to the PVC root.
+                labels:
+                  type: array
+                  items:
+                    type: string
+                  description: Optional category labels (e.g. radarr, sonarr) passed by the client in the torrent-add request.
             status:
               type: object
               properties:

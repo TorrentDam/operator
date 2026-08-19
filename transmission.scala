@@ -19,12 +19,13 @@ case class TorrentInfo(
   name: String,
   infoHash: String,
   phase: String,
-  downloadPath: Option[String]
+  downloadPath: Option[String],
+  labels: List[String]
 )
 
 trait TorrentOps[F[_]]:
   def list: F[List[TorrentInfo]]
-  def create(infoHash: String, name: String, downloadPath: Option[String]): F[Unit]
+  def create(infoHash: String, name: String, downloadPath: Option[String], labels: List[String]): F[Unit]
   def delete(infoHash: String): F[Unit]
 
 case class MagnetInfo(infoHash: String, displayName: Option[String])
@@ -146,7 +147,7 @@ object TransmissionServer:
       "seedIdleMode" -> Json.fromInt(0),
       "fileCount" -> Json.fromInt(0),
       "file-count" -> Json.fromInt(0),
-      "labels" -> Json.fromValues(List(Json.fromString("radarr")))
+      "labels" -> Json.fromValues(t.labels.map(Json.fromString))
     )
     if fields.isEmpty then Json.fromFields(all.toSeq) else Json.fromFields(fields.flatMap(f => all.get(f).map(f -> _)))
 
@@ -169,8 +170,9 @@ object TransmissionServer:
           .getOrElse(m.infoHash.toLowerCase)
         val clientDir = arguments.hcursor.get[String]("download-dir").toOption
           .filter(_.nonEmpty)
+        val labels = arguments.hcursor.get[List[String]]("labels").getOrElse(Nil)
         val downloadPath = clientDir.map(dir => s"$dir/$segment").getOrElse(segment)
-        ops.create(m.infoHash, name, Some(downloadPath)).as(
+        ops.create(m.infoHash, name, Some(downloadPath), labels).as(
           Json.obj(
             "result" -> Json.fromString("success"),
             "arguments" -> Json.obj(
