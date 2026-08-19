@@ -163,7 +163,11 @@ object TransmissionServer:
     parseMagnet(filename) match
       case Some(m) =>
         val name = m.displayName.getOrElse(m.infoHash.toLowerCase)
-        val downloadPath = s"downloading/$name"
+        val segment = Option(java.nio.file.Path.of(name).getFileName)
+          .map(_.toString)
+          .filter(_.nonEmpty)
+          .getOrElse(m.infoHash.toLowerCase)
+        val downloadPath = s"downloading/$segment"
         ops.create(m.infoHash, name, Some(downloadPath)).as(
           Json.obj(
             "result" -> Json.fromString("success"),
