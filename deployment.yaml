@@ -39,6 +39,8 @@ metadata:
     app: torrentdam-operator
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: torrentdam-operator
