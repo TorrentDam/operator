@@ -10,5 +10,6 @@
 //> using dep org.http4s::http4s-dsl::0.23.36
 //> using dep org.typelevel::cats-effect::3.7.0
 //> using dep org.typelevel::cats-effect-direct::1.0.0
+//> using dep org.legogroup::woof-core::0.7.0
 
 object Deps

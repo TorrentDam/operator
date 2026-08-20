@@ -11,6 +11,7 @@ import org.http4s.circe.*
 import org.http4s.dsl.io.*
 import org.http4s.ember.server.EmberServerBuilder
 import org.http4s.server.{Server, ServerBuilder}
+import org.legogroup.woof.{given, *}
 import org.typelevel.ci.*
 
 import java.util.UUID
@@ -32,10 +33,10 @@ case class MagnetInfo(infoHash: String, displayName: Option[String])
 
 object TransmissionServer:
 
-  def stream(ops: TorrentOps[IO], port: Int): Stream[IO, Nothing] =
+  def stream(ops: TorrentOps[IO], port: Int)(using logger: Logger[IO]): Stream[IO, Nothing] =
     Stream.resource(server(ops, port)).flatMap(_ => Stream.never[IO])
 
-  def server(ops: TorrentOps[IO], port: Int): Resource[IO, org.http4s.server.Server] =
+  def server(ops: TorrentOps[IO], port: Int)(using logger: Logger[IO]): Resource[IO, org.http4s.server.Server] =
     val app = routes(ops)
     EmberServerBuilder
       .default[IO]
@@ -46,18 +47,18 @@ object TransmissionServer:
 
   private val SessionHeader = ci"X-Transmission-Session-Id"
 
-  def routes(ops: TorrentOps[IO]): HttpApp[IO] =
+  def routes(ops: TorrentOps[IO])(using logger: Logger[IO]): HttpApp[IO] =
     import org.http4s.dsl.io.{*, given}
 
     Kleisli:
       case req @ POST -> Root / "transmission" / "rpc" =>
         val sessionId = req.headers.get(SessionHeader).map(_.head.value)
         for
-          _ <- IO.println(s"[RPC] POST /transmission/rpc session-id=$sessionId")
+          _ <- Logger[IO].debug(s"POST /transmission/rpc session-id=$sessionId")
           resp <- sessionId match
             case None =>
               val sid = UUID.randomUUID().toString
-              IO.println(s"[RPC] No session-id, returning 409 with $sid") *>
+              Logger[IO].debug(s"No session-id, returning 409 with $sid") *>
               Conflict(
                 Json.obj("result" -> Json.fromString("needs-session-id")),
                 Headers(Header.Raw(SessionHeader, sid))
@@ -65,24 +66,27 @@ object TransmissionServer:
             case Some(_) =>
               for
                 body <- req.as[Json]
-                _ <- IO.println(s"[RPC] Body: ${body.noSpaces}")
-                result <- handleRpc(ops, body)
-                _ <- IO.println(s"[RPC] Result: ${result.noSpaces}")
+                _ <- Logger[IO].debug(s"RPC Body: ${body.noSpaces}")
+                result <- handleRpc(ops, body).handleErrorWith { e =>
+                  Logger[IO].error(s"RPC handler error: ${e.getMessage}") *>
+                    IO.pure(Json.obj("result" -> Json.fromString(s"internal error: ${e.getMessage}")))
+                }
+                _ <- Logger[IO].debug(s"RPC Result: ${result.noSpaces}")
                 response <- Ok(result)
               yield response
         yield resp
       case req @ GET -> Root / "transmission" / "rpc" =>
         val sid = UUID.randomUUID().toString
-        IO.println(s"[RPC] GET /transmission/rpc, returning 409 with $sid") *>
+        Logger[IO].debug(s"GET /transmission/rpc, returning 409 with $sid") *>
         Conflict(
           Json.obj("result" -> Json.fromString("needs-session-id")),
           Headers(Header.Raw(SessionHeader, sid))
         )
       case req @ _ =>
-        IO.println(s"[RPC] Unmatched: ${req.method} ${req.uri}") *>
+        Logger[IO].warn(s"Unmatched: ${req.method} ${req.uri}") *>
         NotFound()
 
-  def handleRpc(ops: TorrentOps[IO], body: Json): IO[Json] =
+  def handleRpc(ops: TorrentOps[IO], body: Json)(using logger: Logger[IO]): IO[Json] =
     val method = body.hcursor.get[String]("method").getOrElse("")
     val arguments = body.hcursor.get[Json]("arguments").getOrElse(Json.obj())
     method match
@@ -92,7 +96,10 @@ object TransmissionServer:
       case "torrent-remove"   => torrentRemove(ops, arguments)
       case "torrent-set"      => IO.pure(success)
       case "queue-move-top"   => IO.pure(success)
-      case _                  => IO.pure(Json.obj("result" -> Json.fromString(s"method '$method' not supported")))
+      case _                  =>
+        Logger[IO].warn(s"Unsupported RPC method: '$method'").as(
+          Json.obj("result" -> Json.fromString(s"method '$method' not supported"))
+        )
 
   private val success: Json =
     Json.obj("result" -> Json.fromString("success"), "arguments" -> Json.obj())
@@ -163,7 +170,7 @@ object TransmissionServer:
       case "Failed"    => 0
       case _           => 0
 
-  private def torrentAdd(ops: TorrentOps[IO], arguments: Json): IO[Json] =
+  private def torrentAdd(ops: TorrentOps[IO], arguments: Json)(using logger: Logger[IO]): IO[Json] =
     val filename = arguments.hcursor.get[String]("filename").getOrElse("")
     parseMagnet(filename) match
       case Some(m) =>
@@ -189,7 +196,9 @@ object TransmissionServer:
           )
         )
       case None =>
-        IO.pure(Json.obj("result" -> Json.fromString("could not parse magnet URI")))
+        Logger[IO].warn(s"Could not parse magnet URI: $filename").as(
+          Json.obj("result" -> Json.fromString("could not parse magnet URI"))
+        )
 
   private def torrentRemove(ops: TorrentOps[IO], arguments: Json): IO[Json] =
     val ids = arguments.hcursor.get[List[String]]("ids").getOrElse(Nil)

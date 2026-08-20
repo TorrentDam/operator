@@ -1,9 +1,9 @@
 import cats.effect.direct.*
 import cats.effect.IO
 import cats.effect.IOApp
+import cats.effect.Resource
 import cats.syntax.all.given
 import cats.Eq
-import com.sun.tools.javac.util.Assert.error
 import dev.hnaderi.k8s.circe.*
 import dev.hnaderi.k8s.client.apis.corev1.{ClusterPodAPI, PodAPI}
 import dev.hnaderi.k8s.client.apis.api_extensions.CustomResourceAPI
@@ -33,53 +33,66 @@ import io.k8s.apimachinery.pkg.api.resource.Quantity
 import io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta
 import org.http4s.circe.*
 import org.http4s.ember.client.EmberClientBuilder
+import org.legogroup.woof.{given, *}
 
 import scala.concurrent.duration.Duration
 
 object OperatorApp extends IOApp.Simple:
 
+  given Filter = Filter.atLeastLevel(LogLevel.Info)
+  given Printer = NoColorPrinter()
+
   def run: IO[Unit] =
     val emberConfig = EmberClientBuilder.default[IO].withIdleConnectionTime(Duration.Inf)
     val client = EmberKubernetesClient[IO](emberConfig).defaultConfig[Json]
-    client.use(operatorLogic)
+    client.use { k8sClient =>
+      DefaultLogger.makeIo(Output.fromConsole[IO]).flatMap { logger =>
+        operatorLogic(k8sClient, logger)
+      }
+    }
 
-  def operatorLogic(client: KClient[IO]): IO[Unit] = async[IO]:
-    registerCustomResource(client).await
-    val operator = Operator(client)
-    val namespace = sys.env.get("WATCH_NAMESPACE")
-    val torrentEvents = namespace match
-      case Some(ns) => new TorrentAPI(ns).list().listen(client)
-      case None    => TorrentClusterAPI.list().listen(client)
-    val podEvents = namespace match
-      case Some(ns) => PodAPI(ns).list().listen(client)
-      case None    => ClusterPodAPI.list().listen(client)
-    val ops = OperatorTorrentOps(client, namespace.getOrElse("default"))
-    val httpServer = TransmissionServer.stream(ops, 9091)
-    torrentEvents
-      .evalTap:
-        case WatchEvent(WatchEventType.ADDED | WatchEventType.MODIFIED, torrent) =>
-          operator.reconcile(torrent)
-        case WatchEvent(WatchEventType.DELETED, torrent) =>
-          operator.delete(torrent)
-        case _ => IO.unit
-      .merge(podEvents.evalTap(operator.onPodEvent))
-      .merge(httpServer)
-      .compile
-      .drain
-      .await
+  def operatorLogic(client: KClient[IO], logger: Logger[IO]): IO[Unit] =
+    given Logger[IO] = logger
+    async[IO]:
+      registerCustomResource(client).await
+      val operator = Operator(client)
+      val namespace = sys.env.get("WATCH_NAMESPACE")
+      val torrentEvents = namespace match
+        case Some(ns) => new TorrentAPI(ns).list().listen(client)
+        case None    => TorrentClusterAPI.list().listen(client)
+      val podEvents = namespace match
+        case Some(ns) => PodAPI(ns).list().listen(client)
+        case None    => ClusterPodAPI.list().listen(client)
+      val ops = OperatorTorrentOps(client, namespace.getOrElse("default"))
+      val httpServer = TransmissionServer.stream(ops, 9091)
+      torrentEvents
+        .evalTap:
+          case WatchEvent(WatchEventType.ADDED | WatchEventType.MODIFIED, torrent) =>
+            operator.reconcile(torrent)
+          case WatchEvent(WatchEventType.DELETED, torrent) =>
+            operator.delete(torrent)
+          case _ => IO.unit
+        .merge(podEvents.evalTap(operator.onPodEvent))
+        .merge(httpServer)
+        .compile
+        .drain
+        .await
 
-  def registerCustomResource(client: KClient[IO]): IO[Unit] = async[IO]:
+  def registerCustomResource(client: KClient[IO])(using logger: Logger[IO]): IO[Unit] = async[IO]:
     import dev.hnaderi.k8s.manifest.yamlReader
     try
       CustomResourceAPI.get("torrents.torrentdam.github.com").send(client).await
-      IO.println("CRD exists").await
+      Logger[IO].info("CRD exists").await
     catch
       case ErrorResponse(error = ErrorStatus.NotFound) =>
         val crdString = Files[IO].readUtf8(Path("crd.yaml")).compile.foldMonoid.await
         val crdYaml = IO.fromEither(SnakeYaml.parse[YAML](crdString)).await
         val crd = IO.fromEither(crdYaml.decodeTo[CustomResourceDefinition].left.map(msg => Throwable(msg))).await
         CustomResourceAPI.create(crd).send(client).await
-        IO.println("CRD created").await
+        Logger[IO].info("CRD created").await
+      case e =>
+        Logger[IO].error(s"Failed to register CRD: ${e.getMessage}").await
+        throw e
 
 end OperatorApp
 
@@ -205,7 +218,7 @@ object TorrentAPI
 class TorrentAPI(val namespace: String = "default") extends TorrentAPI.NamespacedAPIBuilders
 object TorrentClusterAPI extends TorrentAPI.ClusterwideAPIBuilders
 
-class Operator(client: KClient[IO]):
+class Operator(client: KClient[IO])(using logger: Logger[IO]):
 
   def reconcile(resource: Torrent): IO[Unit] = async[IO]:
     val namespace = resource.metadata.namespace.getOrElse("default")
@@ -217,11 +230,11 @@ class Operator(client: KClient[IO]):
     val currentPod = currentPods.items.find(pod => pod.metadata.exists(_.name == Some(podName)))
     currentPod match
       case Some(current) =>
-        podAPI.replace(podName, desired)
-        IO.println(s"Replaced").await
+        podAPI.replace(podName, desired).send(client).await
+        Logger[IO].info(s"Replaced pod $podName for torrent $crName").await
       case None =>
         podAPI.create(desired).send(client).await
-        IO.println("Created").await
+        Logger[IO].info(s"Created pod $podName for torrent $crName").await
     updateStatusByName(namespace, podName, crName).await
 
   def delete(resource: Torrent): IO[Unit] = async[IO]:
@@ -233,7 +246,7 @@ class Operator(client: KClient[IO]):
       name <- metadata.name
     do
       podAPI.delete(name).send(client).void.await
-      IO.println("Deleted").await
+      Logger[IO].info(s"Deleted pod $name for torrent ${resource.metadata.name.getOrElse("")}").await
 
   def onPodEvent(event: WatchEvent[Pod]): IO[Unit] = event match
     case WatchEvent(WatchEventType.ADDED | WatchEventType.MODIFIED, pod) =>
@@ -257,14 +270,20 @@ class Operator(client: KClient[IO]):
           pod.status.flatMap(_.phase).getOrElse("Unknown")
         catch
           case ErrorResponse(error = ErrorStatus.NotFound) => "Unknown"
+          case e =>
+            Logger[IO].error(s"Failed to get pod $podName: ${e.getMessage}").await
+            "Unknown"
       val torrentStatus = TorrentStatus(phase = phase, podName = podName.some)
       try
         val current = torrentAPI.get(crName).send(client).await
         torrentAPI.replaceStatus(crName, current.copy(status = torrentStatus.some)).send(client).void.await
-        IO.println(s"Status updated: $phase").await
+        Logger[IO].info(s"Status updated for $crName: $phase").await
       catch
         case ErrorResponse(error = ErrorStatus.NotFound) =>
-          IO.println(s"Torrent not found, skipping status update: $crName").await
+          Logger[IO].warn(s"Torrent not found, skipping status update: $crName").await
+        case e =>
+          Logger[IO].error(s"Failed to update status for $crName: ${e.getMessage}").await
+          throw e
 
   private def podNameFor(resource: Torrent): String =
     val prefix = resource.spec.infoHash.toLowerCase.take(10)
@@ -276,7 +295,7 @@ class Operator(client: KClient[IO]):
       Option.when(downloadPath.nonEmpty) {
         Lifecycle(
           preStop = LifecycleHandler(
-            exec = ExecAction(command = Seq("rm", "-rf", s"/data/$downloadPath").some).some
+            exec = ExecAction(command = Seq("rm", "-rf", s"/data/$downloadPath")).some
           ).some
         )
       }
@@ -339,7 +358,7 @@ class Operator(client: KClient[IO]):
 end Operator
 
 object OperatorTorrentOps:
-  def apply(client: KClient[IO], namespace: String): TorrentOps[IO] =
+  def apply(client: KClient[IO], namespace: String)(using logger: Logger[IO]): TorrentOps[IO] =
     new TorrentOps[IO]:
       def list: IO[List[TorrentInfo]] = async[IO]:
         val torrents = new TorrentAPI(namespace).list().send(client).await
@@ -373,16 +392,22 @@ object OperatorTorrentOps:
         )
         try
           new TorrentAPI(namespace).create(torrent).send(client).await
-          IO.println(s"Torrent created via API: $crName").await
+          Logger[IO].info(s"Torrent created via API: $crName").await
         catch
           case ErrorResponse(error = ErrorStatus.Conflict) =>
-            IO.println(s"Torrent already exists: $crName").await
+            Logger[IO].info(s"Torrent already exists: $crName").await
+          case e =>
+            Logger[IO].error(s"Failed to create torrent $crName: ${e.getMessage}").await
+            throw e
 
       def delete(infoHash: String): IO[Unit] = async[IO]:
         val name = infoHash.toLowerCase
         try
           new TorrentAPI(namespace).delete(name).send(client).void.await
-          IO.println(s"Torrent deleted via API: $name").await
+          Logger[IO].info(s"Torrent deleted via API: $name").await
         catch
           case ErrorResponse(error = ErrorStatus.NotFound) =>
-            IO.println(s"Torrent not found for deletion: $name").await
+            Logger[IO].warn(s"Torrent not found for deletion: $name").await
+          case e =>
+            Logger[IO].error(s"Failed to delete torrent $name: ${e.getMessage}").await
+            throw e
