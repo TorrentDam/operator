@@ -39,7 +39,7 @@ import scala.concurrent.duration.Duration
 
 object OperatorApp extends IOApp.Simple:
 
-  given Filter = Filter.atLeastLevel(LogLevel.Info)
+  given Filter = Filter.atLeastLevel(LogLevel.Debug)
   given Printer = NoColorPrinter()
 
   def run: IO[Unit] =
