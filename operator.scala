@@ -293,7 +293,7 @@ class Operator(client: KClient[IO])(using logger: Logger[IO]):
       Option.when(downloadPath.nonEmpty) {
         Lifecycle(
           preStop = LifecycleHandler(
-            exec = ExecAction(command = Seq("rm", "-rf", s"/data/$downloadPath")).some
+            exec = ExecAction(command = Seq("sh", "-c", s"cd / && rm -rf /data/$downloadPath")).some
           ).some
         )
       }
