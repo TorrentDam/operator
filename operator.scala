@@ -230,12 +230,14 @@ class Operator(client: KClient[IO])(using logger: Logger[IO]):
     val currentPod = currentPods.items.find(pod => pod.metadata.exists(_.name == Some(podName)))
     currentPod match
       case Some(current) =>
-        podAPI.replace(podName, desired).send(client).await
-        Logger[IO].info(s"Replaced pod $podName for torrent $crName").await
+        if current.spec == desired.spec then
+          Logger[IO].debug(s"Pod $podName spec unchanged for torrent $crName, skipping replace").await
+        else
+          podAPI.replace(podName, desired).send(client).await
+          Logger[IO].info(s"Replaced pod $podName for torrent $crName").await
       case None =>
         podAPI.create(desired).send(client).await
         Logger[IO].info(s"Created pod $podName for torrent $crName").await
-    updateStatusByName(namespace, podName, crName).await
 
   def delete(resource: Torrent): IO[Unit] = async[IO]:
     val namespace = resource.metadata.namespace.getOrElse("default")
