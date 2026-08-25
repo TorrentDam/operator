@@ -313,7 +313,8 @@ class Operator(client: KClient[IO])(using logger: Logger[IO]):
     val needsFinalizer = resource.spec.downloadPath.exists(_.nonEmpty)
     if needsFinalizer && !hasFinalizer then
       val torrentAPI = TorrentAPI(namespace)
-      val updated = resource.copy(metadata = resource.metadata.addFinalizers(finalizerName))
+      val current = torrentAPI.get(crName).send(client).await
+      val updated = current.copy(metadata = current.metadata.addFinalizers(finalizerName))
       torrentAPI.replace(crName, updated).send(client).void.await
       Logger[IO].info(s"Added finalizer to torrent $crName").await
 
@@ -321,8 +322,9 @@ class Operator(client: KClient[IO])(using logger: Logger[IO]):
     val namespace = resource.metadata.namespace.getOrElse("default")
     val crName = resource.metadata.name.getOrElse("")
     val torrentAPI = TorrentAPI(namespace)
-    val finalizers = resource.metadata.finalizers.getOrElse(Nil).filterNot(_ == finalizerName)
-    val updated = resource.copy(metadata = resource.metadata.withFinalizers(finalizers))
+    val current = torrentAPI.get(crName).send(client).await
+    val finalizers = current.metadata.finalizers.getOrElse(Nil).filterNot(_ == finalizerName)
+    val updated = current.copy(metadata = current.metadata.withFinalizers(finalizers))
     torrentAPI.replace(crName, updated).send(client).void.await
 
   def onPodEvent(event: WatchEvent[Pod]): IO[Unit] = event match
