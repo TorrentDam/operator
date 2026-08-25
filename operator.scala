@@ -368,7 +368,8 @@ class Operator(client: KClient[IO])(using logger: Logger[IO]):
           containerPort = 9000,
           name = "events".some
         )
-      ).some
+      ).some,
+      restartPolicy = "Always".some
     )
     Pod(
       metadata = ObjectMeta(
@@ -392,7 +393,8 @@ class Operator(client: KClient[IO])(using logger: Logger[IO]):
       spec = PodSpec(
         restartPolicy = "OnFailure".some,
         terminationGracePeriodSeconds = 300L.some,
-        containers = Seq(container, eventsContainer),
+        initContainers = Seq(eventsContainer).some,
+        containers = Seq(container),
         volumes = Seq(
           Volume(
             name = "data",
