@@ -259,6 +259,7 @@ class Operator(client: KClient[IO])(using logger: Logger[IO]):
   def onTorrentDeletion(resource: Torrent): IO[Unit] = async[IO]:
     val namespace = resource.metadata.namespace.getOrElse("default")
     val crName = resource.metadata.name.getOrElse("")
+    deleteTorrentPod(resource, namespace).await
     resource.spec.downloadPath match
       case Some(downloadPath) if downloadPath.nonEmpty =>
         Logger[IO].info(s"Cleaning up PVC path /data/$downloadPath for torrent $crName").await
@@ -270,6 +271,16 @@ class Operator(client: KClient[IO])(using logger: Logger[IO]):
         Logger[IO].info(s"Cleanup complete, finalizer removed for torrent $crName").await
       case _ =>
         removeFinalizer(resource).await
+
+  private def deleteTorrentPod(resource: Torrent, namespace: String): IO[Unit] = async[IO]:
+    val podName = podNameFor(resource)
+    val podAPI = PodAPI(namespace)
+    try
+      podAPI.delete(podName).send(client).void.await
+      Logger[IO].info(s"Deleted torrent pod $podName").await
+    catch
+      case ErrorResponse(error = ErrorStatus.NotFound) =>
+        Logger[IO].debug(s"Torrent pod $podName already gone").await
 
   private def waitForTorrentPodTermination(resource: Torrent, namespace: String): IO[Unit] =
     async[IO]:
