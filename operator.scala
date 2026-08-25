@@ -265,7 +265,10 @@ class Operator(client: KClient[IO])(using logger: Logger[IO]):
         Logger[IO].info(s"Cleaning up PVC path /data/$downloadPath for torrent $crName").await
         waitForTorrentPodTermination(resource, namespace).await
         val target = Path("/data") / downloadPath
-        Files[IO].deleteRecursively(target).await
+        Files[IO].exists(target).flatMap(exists =>
+          if exists then Files[IO].deleteRecursively(target)
+          else Logger[IO].debug(s"$target already gone")
+        ).await
         Logger[IO].info(s"Deleted $target for torrent $crName").await
         removeFinalizer(resource).await
         Logger[IO].info(s"Cleanup complete, finalizer removed for torrent $crName").await
