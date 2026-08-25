@@ -18,6 +18,8 @@ import fs2.Stream
 import fs2.io.file.{Files, Path}
 import io.circe.Json
 import io.k8s.api.core.v1.Container
+import io.k8s.api.core.v1.ContainerPort
+import io.k8s.api.core.v1.EmptyDirVolumeSource
 import io.k8s.api.core.v1.EnvVar
 import io.k8s.api.core.v1.ExecAction
 import io.k8s.api.core.v1.Lifecycle
@@ -306,7 +308,9 @@ class Operator(client: KClient[IO])(using logger: Logger[IO]):
         "--info-hash",
         resource.spec.infoHash,
         "--dht-node",
-        resource.spec.dhtNode
+        resource.spec.dhtNode,
+        "--events",
+        "/var/torrentdam/events.json"
       ).some,
       workingDir = (Path("/data") / downloadPath).toString.some,
       env = Seq(
@@ -319,6 +323,10 @@ class Operator(client: KClient[IO])(using logger: Logger[IO]):
         VolumeMount(
           name = "data",
           mountPath = "/data"
+        ),
+        VolumeMount(
+          name = "events",
+          mountPath = "/var/torrentdam"
         )
       ).some,
       resources = ResourceRequirements(
@@ -329,6 +337,34 @@ class Operator(client: KClient[IO])(using logger: Logger[IO]):
       ).some
     )
     val container = cleanupLifecycle.fold(baseContainer)(baseContainer.withLifecycle)
+    val eventsContainer = Container(
+      name = "events",
+      image = "alpine:3.21".some,
+      command = Seq(
+        "nc",
+        "-lk",
+        "-p",
+        "9000",
+        "-e",
+        "tail",
+        "-F",
+        "-n",
+        "0",
+        "/var/torrentdam/events.json"
+      ).some,
+      volumeMounts = Seq(
+        VolumeMount(
+          name = "events",
+          mountPath = "/var/torrentdam"
+        )
+      ).some,
+      ports = Seq(
+        ContainerPort(
+          containerPort = 9000,
+          name = "events".some
+        )
+      ).some
+    )
     Pod(
       metadata = ObjectMeta(
         name = podNameFor(resource).some,
@@ -341,13 +377,17 @@ class Operator(client: KClient[IO])(using logger: Logger[IO]):
       spec = PodSpec(
         restartPolicy = "OnFailure".some,
         terminationGracePeriodSeconds = 300L.some,
-        containers = Seq(container),
+        containers = Seq(container, eventsContainer),
         volumes = Seq(
           Volume(
             name = "data",
             persistentVolumeClaim = PersistentVolumeClaimVolumeSource(
               claimName = resource.spec.pvcName
             ).some
+          ),
+          Volume(
+            name = "events",
+            emptyDir = EmptyDirVolumeSource().some
           )
         ).some
       ).some
