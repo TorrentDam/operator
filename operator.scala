@@ -72,7 +72,7 @@ object OperatorApp extends IOApp.Simple:
         .evalTap:
           case WatchEvent(WatchEventType.ADDED | WatchEventType.MODIFIED, torrent) =>
             if torrent.metadata.deletionTimestamp.isDefined then
-              operator.onTorrentDeletion(torrent)
+              operator.onTorrentDeletion(torrent).start.void
             else
               operator.reconcile(torrent)
           case _ => IO.unit
@@ -283,28 +283,25 @@ class Operator(client: KClient[IO])(using logger: Logger[IO]):
         Logger[IO].debug(s"Torrent pod $podName already gone").await
 
   private def waitForTorrentPodTermination(resource: Torrent, namespace: String): IO[Unit] =
-    async[IO]:
-      val podName = podNameFor(resource)
-      val podAPI = PodAPI(namespace)
-      def attempt(n: Int): IO[Unit] =
-        if n >= 120 then
-          Logger[IO].warn(s"Torrent pod $podName still present after 10 min, proceeding with cleanup")
-        else
-          val phase =
-            try
-              val pod = podAPI.get(podName).send(client).await
-              pod.status.flatMap(_.phase).getOrElse("Unknown")
-            catch
-              case ErrorResponse(error = ErrorStatus.NotFound) => "Gone"
-              case e =>
-                Logger[IO].error(s"Failed to get torrent pod $podName: ${e.getMessage}").await
-                "Unknown"
-          phase match
-            case "Gone" | "Succeeded" | "Failed" => IO.unit
-            case _ =>
-              Logger[IO].debug(s"Waiting for torrent pod $podName to terminate (phase=$phase)").await
+    val podName = podNameFor(resource)
+    val podAPI = PodAPI(namespace)
+    def attempt(n: Int): IO[Unit] =
+      if n >= 120 then
+        Logger[IO].warn(s"Torrent pod $podName still present after 10 min, proceeding with cleanup")
+      else
+        podAPI.get(podName).send(client).attempt.flatMap:
+          case Right(pod) =>
+            val phase = pod.status.flatMap(_.phase).getOrElse("Unknown")
+            phase match
+              case "Succeeded" | "Failed" => IO.unit
+              case _ =>
+                Logger[IO].debug(s"Waiting for torrent pod $podName to terminate (phase=$phase)") *>
+                  IO.sleep(5.seconds) *> attempt(n + 1)
+          case Left(ErrorResponse(error = ErrorStatus.NotFound)) => IO.unit
+          case Left(e) =>
+            Logger[IO].error(s"Failed to get torrent pod $podName: ${e.getMessage}") *>
               IO.sleep(5.seconds) *> attempt(n + 1)
-      attempt(0).await
+    attempt(0)
 
   private def ensureFinalizer(resource: Torrent): IO[Unit] = async[IO]:
     val namespace = resource.metadata.namespace.getOrElse("default")
