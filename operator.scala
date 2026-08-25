@@ -72,7 +72,7 @@ object OperatorApp extends IOApp.Simple:
         .evalTap:
           case WatchEvent(WatchEventType.ADDED | WatchEventType.MODIFIED, torrent) =>
             if torrent.metadata.deletionTimestamp.isDefined then
-              operator.onTorrentDeletion(torrent).start.void
+              operator.onTorrentDeletion(torrent)
             else
               operator.reconcile(torrent)
           case _ => IO.unit
@@ -322,9 +322,8 @@ class Operator(client: KClient[IO])(using logger: Logger[IO]):
     val namespace = resource.metadata.namespace.getOrElse("default")
     val crName = resource.metadata.name.getOrElse("")
     val torrentAPI = TorrentAPI(namespace)
-    val current = torrentAPI.get(crName).send(client).await
-    val finalizers = current.metadata.finalizers.getOrElse(Nil).filterNot(_ == finalizerName)
-    val updated = current.copy(metadata = current.metadata.withFinalizers(finalizers))
+    val finalizers = resource.metadata.finalizers.getOrElse(Nil).filterNot(_ == finalizerName)
+    val updated = resource.copy(metadata = resource.metadata.withFinalizers(finalizers))
     torrentAPI.replace(crName, updated).send(client).void.await
 
   def onPodEvent(event: WatchEvent[Pod]): IO[Unit] = event match
@@ -355,8 +354,11 @@ class Operator(client: KClient[IO])(using logger: Logger[IO]):
       val torrentStatus = TorrentStatus(phase = phase, podName = podName.some)
       try
         val current = torrentAPI.get(crName).send(client).await
-        torrentAPI.replaceStatus(crName, current.copy(status = torrentStatus.some)).send(client).void.await
-        Logger[IO].info(s"Status updated for $crName: $phase").await
+        if current.metadata.deletionTimestamp.isDefined then
+          Logger[IO].debug(s"Torrent $crName being deleted, skipping status update").await
+        else
+          torrentAPI.replaceStatus(crName, current.copy(status = torrentStatus.some)).send(client).void.await
+          Logger[IO].info(s"Status updated for $crName: $phase").await
       catch
         case ErrorResponse(error = ErrorStatus.NotFound) =>
           Logger[IO].warn(s"Torrent not found, skipping status update: $crName").await
