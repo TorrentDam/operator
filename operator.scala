@@ -263,7 +263,9 @@ class Operator(client: KClient[IO])(using logger: Logger[IO]):
       case Some(downloadPath) if downloadPath.nonEmpty =>
         Logger[IO].info(s"Cleaning up PVC path /data/$downloadPath for torrent $crName").await
         waitForTorrentPodTermination(resource, namespace).await
-        runCleanupPod(resource, namespace, downloadPath).await
+        val target = Path("/data") / downloadPath
+        Files[IO].deleteRecursively(target).await
+        Logger[IO].info(s"Deleted $target for torrent $crName").await
         removeFinalizer(resource).await
         Logger[IO].info(s"Cleanup complete, finalizer removed for torrent $crName").await
       case _ =>
@@ -311,86 +313,6 @@ class Operator(client: KClient[IO])(using logger: Logger[IO]):
     val finalizers = resource.metadata.finalizers.getOrElse(Nil).filterNot(_ == finalizerName)
     val updated = resource.copy(metadata = resource.metadata.withFinalizers(finalizers))
     torrentAPI.replace(crName, updated).send(client).void.await
-
-  private def runCleanupPod(resource: Torrent, namespace: String, downloadPath: String): IO[Unit] =
-    async[IO]:
-      val podAPI = PodAPI(namespace)
-      val crName = resource.metadata.name.getOrElse("")
-      val cleanupPodName = s"${podNameFor(resource)}-cleanup"
-      val cleanupPod = Pod(
-        metadata = ObjectMeta(
-          name = cleanupPodName.some,
-          namespace = namespace.some,
-          labels = Map("app" -> "torrentdam-cleanup", "torrent" -> crName).some,
-          ownerReferences = Seq(
-            OwnerReference(
-              apiVersion = "torrentdam.github.com/v1",
-              kind = "Torrent",
-              name = crName,
-              uid = resource.metadata.uid.getOrElse(""),
-              controller = true.some,
-              blockOwnerDeletion = true.some
-            )
-          ).some
-        ).some,
-        spec = PodSpec(
-          restartPolicy = "Never".some,
-          terminationGracePeriodSeconds = 60L.some,
-          containers = Seq(
-            Container(
-              name = "cleanup",
-              image = "alpine:3.21".some,
-              command = Seq("sh", "-c", s"rm -rf -- \"/data/$downloadPath\"").some,
-              volumeMounts = Seq(
-                VolumeMount(name = "data", mountPath = "/data")
-              ).some
-            )
-          ),
-          volumes = Seq(
-            Volume(
-              name = "data",
-              persistentVolumeClaim = PersistentVolumeClaimVolumeSource(
-                claimName = resource.spec.pvcName
-              ).some
-            )
-          ).some
-        ).some
-      )
-      try
-        podAPI.create(cleanupPod).send(client).await
-        Logger[IO].info(s"Created cleanup pod $cleanupPodName").await
-      catch
-        case ErrorResponse(error = ErrorStatus.Conflict) =>
-          Logger[IO].info(s"Cleanup pod $cleanupPodName already exists, waiting for it").await
-      waitForPodCompletion(podAPI, cleanupPodName, maxAttempts = 120).await
-
-  private def waitForPodCompletion(podAPI: => PodAPI, podName: String, maxAttempts: Int): IO[Unit] =
-    async[IO]:
-      def attempt(n: Int): IO[Unit] =
-        if n >= maxAttempts then
-          for
-            _ <- Logger[IO].error(s"Cleanup pod $podName did not complete in time")
-            _ <- IO.raiseError(new Exception(s"Cleanup pod $podName timed out"))
-          yield ()
-        else
-          val phase =
-            try
-              val pod = podAPI.get(podName).send(client).await
-              pod.status.flatMap(_.phase).getOrElse("Unknown")
-            catch
-              case ErrorResponse(error = ErrorStatus.NotFound) => "Succeeded"
-              case e =>
-                Logger[IO].error(s"Failed to get cleanup pod $podName: ${e.getMessage}").await
-                "Unknown"
-          phase match
-            case "Succeeded" =>
-              Logger[IO].info(s"Cleanup pod $podName succeeded").await
-              IO.unit
-            case "Failed"    => IO.raiseError(new Exception(s"Cleanup pod $podName failed"))
-            case _           =>
-              Logger[IO].debug(s"Waiting for cleanup pod $podName (phase=$phase, attempt=$n)").await
-              IO.sleep(5.seconds) *> attempt(n + 1)
-      attempt(0).await
 
   def onPodEvent(event: WatchEvent[Pod]): IO[Unit] = event match
     case WatchEvent(WatchEventType.ADDED | WatchEventType.MODIFIED, pod) =>
