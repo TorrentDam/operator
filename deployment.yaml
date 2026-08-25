@@ -29,7 +29,7 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: torrentdam-operator
-    namespace: media-server
+    namespace: default
 ---
 apiVersion: apps/v1
 kind: Deployment
