@@ -33,6 +33,7 @@ import io.k8s.api.core.v1.VolumeMount
 import io.k8s.apiextensions_apiserver.pkg.apis.apiextensions.v1.CustomResourceDefinition
 import io.k8s.apimachinery.pkg.api.resource.Quantity
 import io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta
+import io.k8s.apimachinery.pkg.apis.meta.v1.OwnerReference
 import org.http4s.circe.*
 import org.http4s.ember.client.EmberClientBuilder
 import org.legogroup.woof.{given, *}
@@ -74,8 +75,6 @@ object OperatorApp extends IOApp.Simple:
         .evalTap:
           case WatchEvent(WatchEventType.ADDED | WatchEventType.MODIFIED, torrent) =>
             operator.reconcile(torrent)
-          case WatchEvent(WatchEventType.DELETED, torrent) =>
-            operator.delete(torrent)
           case _ => IO.unit
         .merge(podEvents.evalTap(operator.onPodEvent))
         .merge(httpServer)
@@ -254,17 +253,6 @@ class Operator(client: KClient[IO])(using logger: Logger[IO]):
         podAPI.create(desired).send(client).await
         Logger[IO].info(s"Created pod $podName for torrent $crName").await
 
-  def delete(resource: Torrent): IO[Unit] = async[IO]:
-    val namespace = resource.metadata.namespace.getOrElse("default")
-    val podAPI = PodAPI(namespace)
-    val pod = getPod(resource)
-    for
-      metadata <- pod.metadata
-      name <- metadata.name
-    do
-      podAPI.delete(name).send(client).void.await
-      Logger[IO].info(s"Deleted pod $name for torrent ${resource.metadata.name.getOrElse("")}").await
-
   def onPodEvent(event: WatchEvent[Pod]): IO[Unit] = event match
     case WatchEvent(WatchEventType.ADDED | WatchEventType.MODIFIED, pod) =>
       val isTorrentPod = pod.metadata.exists(_.labels.exists(_.get("app").contains("torrentdam")))
@@ -389,6 +377,16 @@ class Operator(client: KClient[IO])(using logger: Logger[IO]):
         labels = Map(
           "app" -> "torrentdam",
           "torrent" -> resource.metadata.name.getOrElse("")
+        ).some,
+        ownerReferences = Seq(
+          OwnerReference(
+            apiVersion = "torrentdam.github.com/v1",
+            kind = "Torrent",
+            name = resource.metadata.name.getOrElse(""),
+            uid = resource.metadata.uid.getOrElse(""),
+            controller = true.some,
+            blockOwnerDeletion = true.some
+          )
         ).some
       ).some,
       spec = PodSpec(
