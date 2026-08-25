@@ -262,11 +262,36 @@ class Operator(client: KClient[IO])(using logger: Logger[IO]):
     resource.spec.downloadPath match
       case Some(downloadPath) if downloadPath.nonEmpty =>
         Logger[IO].info(s"Cleaning up PVC path /data/$downloadPath for torrent $crName").await
+        waitForTorrentPodTermination(resource, namespace).await
         runCleanupPod(resource, namespace, downloadPath).await
         removeFinalizer(resource).await
         Logger[IO].info(s"Cleanup complete, finalizer removed for torrent $crName").await
       case _ =>
         removeFinalizer(resource).await
+
+  private def waitForTorrentPodTermination(resource: Torrent, namespace: String): IO[Unit] =
+    async[IO]:
+      val podName = podNameFor(resource)
+      val podAPI = PodAPI(namespace)
+      def attempt(n: Int): IO[Unit] =
+        if n >= 120 then
+          Logger[IO].warn(s"Torrent pod $podName still present after 10 min, proceeding with cleanup")
+        else
+          val phase =
+            try
+              val pod = podAPI.get(podName).send(client).await
+              pod.status.flatMap(_.phase).getOrElse("Unknown")
+            catch
+              case ErrorResponse(error = ErrorStatus.NotFound) => "Gone"
+              case e =>
+                Logger[IO].error(s"Failed to get torrent pod $podName: ${e.getMessage}").await
+                "Unknown"
+          phase match
+            case "Gone" | "Succeeded" | "Failed" => IO.unit
+            case _ =>
+              Logger[IO].debug(s"Waiting for torrent pod $podName to terminate (phase=$phase)").await
+              IO.sleep(5.seconds) *> attempt(n + 1)
+      attempt(0).await
 
   private def ensureFinalizer(resource: Torrent): IO[Unit] = async[IO]:
     val namespace = resource.metadata.namespace.getOrElse("default")
@@ -358,9 +383,13 @@ class Operator(client: KClient[IO])(using logger: Logger[IO]):
                 Logger[IO].error(s"Failed to get cleanup pod $podName: ${e.getMessage}").await
                 "Unknown"
           phase match
-            case "Succeeded" => IO.unit
+            case "Succeeded" =>
+              Logger[IO].info(s"Cleanup pod $podName succeeded").await
+              IO.unit
             case "Failed"    => IO.raiseError(new Exception(s"Cleanup pod $podName failed"))
-            case _           => IO.sleep(5.seconds) *> attempt(n + 1)
+            case _           =>
+              Logger[IO].debug(s"Waiting for cleanup pod $podName (phase=$phase, attempt=$n)").await
+              IO.sleep(5.seconds) *> attempt(n + 1)
       attempt(0).await
 
   def onPodEvent(event: WatchEvent[Pod]): IO[Unit] = event match
