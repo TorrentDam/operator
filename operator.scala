@@ -84,17 +84,18 @@ object OperatorApp extends IOApp.Simple:
         .await
 
   def watchStream[A](stream: => Stream[IO, A])(using logger: Logger[IO]): Stream[IO, A] =
-    Stream
-      .eval(Logger[IO].info("Starting watch stream"))
-      .flatMap(_ => stream.attempt)
-      .evalMap:
-        case Right(a) => IO.pure(a.some)
-        case Left(e)  => Logger[IO].error(s"Watch stream error: ${e.getMessage}").as(Option.empty[A])
-      .unNone
-      .onFinalizeCase:
-        case ec =>
-          Logger[IO].warn(s"Watch stream ended ($ec), reconnecting in 5 seconds") >> IO.sleep(5.seconds)
-      .repeat
+    Stream.eval(Logger[IO].info("Starting watch stream")).flatMap(_ => stream) ++
+      Stream
+        .eval(Logger[IO].warn("Watch stream ended, reconnecting in 5 seconds") >> IO.sleep(5.seconds))
+        .flatMap(_ =>
+          Stream.eval(Logger[IO].info("Reconnecting to watch stream"))
+            .flatMap(_ => stream.attempt)
+            .evalMap:
+              case Right(a) => IO.pure(a.some)
+              case Left(e)  => Logger[IO].error(s"Watch stream error: ${e.getMessage}").as(Option.empty[A])
+            .unNone
+        )
+        .repeat
 
   def registerCustomResource(client: KClient[IO])(using logger: Logger[IO]): IO[Unit] = async[IO]:
     import dev.hnaderi.k8s.manifest.yamlReader
