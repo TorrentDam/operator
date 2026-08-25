@@ -38,6 +38,7 @@ import org.http4s.ember.client.EmberClientBuilder
 import org.legogroup.woof.{given, *}
 
 import scala.concurrent.duration.Duration
+import scala.concurrent.duration.DurationInt
 
 object OperatorApp extends IOApp.Simple:
 
@@ -59,12 +60,14 @@ object OperatorApp extends IOApp.Simple:
       registerCustomResource(client).await
       val operator = Operator(client)
       val namespace = sys.env.get("WATCH_NAMESPACE")
-      val torrentEvents = namespace match
-        case Some(ns) => new TorrentAPI(ns).list().listen(client)
-        case None    => TorrentClusterAPI.list().listen(client)
-      val podEvents = namespace match
-        case Some(ns) => PodAPI(ns).list().listen(client)
-        case None    => ClusterPodAPI.list().listen(client)
+      val torrentEvents = watchStream:
+        namespace match
+          case Some(ns) => new TorrentAPI(ns).list().listen(client)
+          case None    => TorrentClusterAPI.list().listen(client)
+      val podEvents = watchStream:
+        namespace match
+          case Some(ns) => PodAPI(ns).list().listen(client)
+          case None    => ClusterPodAPI.list().listen(client)
       val ops = OperatorTorrentOps(client, namespace.getOrElse("default"))
       val httpServer = TransmissionServer.stream(ops, 9091)
       torrentEvents
@@ -79,6 +82,19 @@ object OperatorApp extends IOApp.Simple:
         .compile
         .drain
         .await
+
+  def watchStream[A](stream: => Stream[IO, A])(using logger: Logger[IO]): Stream[IO, A] =
+    Stream
+      .eval(Logger[IO].info("Starting watch stream"))
+      .flatMap(_ => stream.attempt)
+      .evalMap:
+        case Right(a) => IO.pure(a.some)
+        case Left(e)  => Logger[IO].error(s"Watch stream error: ${e.getMessage}").as(Option.empty[A])
+      .unNone
+      .onFinalizeCase:
+        case ec =>
+          Logger[IO].warn(s"Watch stream ended ($ec), reconnecting in 5 seconds") >> IO.sleep(5.seconds)
+      .repeat
 
   def registerCustomResource(client: KClient[IO])(using logger: Logger[IO]): IO[Unit] = async[IO]:
     import dev.hnaderi.k8s.manifest.yamlReader
