@@ -21,9 +21,6 @@ import io.k8s.api.core.v1.Container
 import io.k8s.api.core.v1.ContainerPort
 import io.k8s.api.core.v1.EmptyDirVolumeSource
 import io.k8s.api.core.v1.EnvVar
-import io.k8s.api.core.v1.ExecAction
-import io.k8s.api.core.v1.Lifecycle
-import io.k8s.api.core.v1.LifecycleHandler
 import io.k8s.api.core.v1.PersistentVolumeClaimVolumeSource
 import io.k8s.api.core.v1.Pod
 import io.k8s.api.core.v1.PodSpec
@@ -74,7 +71,10 @@ object OperatorApp extends IOApp.Simple:
       torrentEvents
         .evalTap:
           case WatchEvent(WatchEventType.ADDED | WatchEventType.MODIFIED, torrent) =>
-            operator.reconcile(torrent)
+            if torrent.metadata.deletionTimestamp.isDefined then
+              operator.onTorrentDeletion(torrent)
+            else
+              operator.reconcile(torrent)
           case _ => IO.unit
         .merge(podEvents.evalTap(operator.onPodEvent))
         .merge(httpServer)
@@ -238,6 +238,8 @@ object TorrentClusterAPI extends TorrentAPI.ClusterwideAPIBuilders
 
 class Operator(client: KClient[IO])(using logger: Logger[IO]):
 
+  private val finalizerName = "torrentdam.github.com/pvc-cleanup"
+
   def reconcile(resource: Torrent): IO[Unit] = async[IO]:
     val namespace = resource.metadata.namespace.getOrElse("default")
     val crName = resource.metadata.name.getOrElse("")
@@ -252,6 +254,114 @@ class Operator(client: KClient[IO])(using logger: Logger[IO]):
       case None =>
         podAPI.create(desired).send(client).await
         Logger[IO].info(s"Created pod $podName for torrent $crName").await
+    ensureFinalizer(resource).await
+
+  def onTorrentDeletion(resource: Torrent): IO[Unit] = async[IO]:
+    val namespace = resource.metadata.namespace.getOrElse("default")
+    val crName = resource.metadata.name.getOrElse("")
+    resource.spec.downloadPath match
+      case Some(downloadPath) if downloadPath.nonEmpty =>
+        Logger[IO].info(s"Cleaning up PVC path /data/$downloadPath for torrent $crName").await
+        runCleanupPod(resource, namespace, downloadPath).await
+        removeFinalizer(resource).await
+        Logger[IO].info(s"Cleanup complete, finalizer removed for torrent $crName").await
+      case _ =>
+        removeFinalizer(resource).await
+
+  private def ensureFinalizer(resource: Torrent): IO[Unit] = async[IO]:
+    val namespace = resource.metadata.namespace.getOrElse("default")
+    val crName = resource.metadata.name.getOrElse("")
+    val hasFinalizer = resource.metadata.finalizers.exists(_.contains(finalizerName))
+    val needsFinalizer = resource.spec.downloadPath.exists(_.nonEmpty)
+    if needsFinalizer && !hasFinalizer then
+      val torrentAPI = TorrentAPI(namespace)
+      val updated = resource.copy(metadata = resource.metadata.addFinalizers(finalizerName))
+      torrentAPI.replace(crName, updated).send(client).void.await
+      Logger[IO].info(s"Added finalizer to torrent $crName").await
+
+  private def removeFinalizer(resource: Torrent): IO[Unit] = async[IO]:
+    val namespace = resource.metadata.namespace.getOrElse("default")
+    val crName = resource.metadata.name.getOrElse("")
+    val torrentAPI = TorrentAPI(namespace)
+    val finalizers = resource.metadata.finalizers.getOrElse(Nil).filterNot(_ == finalizerName)
+    val updated = resource.copy(metadata = resource.metadata.withFinalizers(finalizers))
+    torrentAPI.replace(crName, updated).send(client).void.await
+
+  private def runCleanupPod(resource: Torrent, namespace: String, downloadPath: String): IO[Unit] =
+    async[IO]:
+      val podAPI = PodAPI(namespace)
+      val crName = resource.metadata.name.getOrElse("")
+      val cleanupPodName = s"${podNameFor(resource)}-cleanup"
+      val cleanupPod = Pod(
+        metadata = ObjectMeta(
+          name = cleanupPodName.some,
+          namespace = namespace.some,
+          labels = Map("app" -> "torrentdam-cleanup", "torrent" -> crName).some,
+          ownerReferences = Seq(
+            OwnerReference(
+              apiVersion = "torrentdam.github.com/v1",
+              kind = "Torrent",
+              name = crName,
+              uid = resource.metadata.uid.getOrElse(""),
+              controller = true.some,
+              blockOwnerDeletion = true.some
+            )
+          ).some
+        ).some,
+        spec = PodSpec(
+          restartPolicy = "Never".some,
+          terminationGracePeriodSeconds = 60L.some,
+          containers = Seq(
+            Container(
+              name = "cleanup",
+              image = "alpine:3.21".some,
+              command = Seq("sh", "-c", s"rm -rf -- \"/data/$downloadPath\"").some,
+              volumeMounts = Seq(
+                VolumeMount(name = "data", mountPath = "/data")
+              ).some
+            )
+          ),
+          volumes = Seq(
+            Volume(
+              name = "data",
+              persistentVolumeClaim = PersistentVolumeClaimVolumeSource(
+                claimName = resource.spec.pvcName
+              ).some
+            )
+          ).some
+        ).some
+      )
+      try
+        podAPI.create(cleanupPod).send(client).await
+        Logger[IO].info(s"Created cleanup pod $cleanupPodName").await
+      catch
+        case ErrorResponse(error = ErrorStatus.Conflict) =>
+          Logger[IO].info(s"Cleanup pod $cleanupPodName already exists, waiting for it").await
+      waitForPodCompletion(podAPI, cleanupPodName, maxAttempts = 120).await
+
+  private def waitForPodCompletion(podAPI: => PodAPI, podName: String, maxAttempts: Int): IO[Unit] =
+    async[IO]:
+      def attempt(n: Int): IO[Unit] =
+        if n >= maxAttempts then
+          for
+            _ <- Logger[IO].error(s"Cleanup pod $podName did not complete in time")
+            _ <- IO.raiseError(new Exception(s"Cleanup pod $podName timed out"))
+          yield ()
+        else
+          val phase =
+            try
+              val pod = podAPI.get(podName).send(client).await
+              pod.status.flatMap(_.phase).getOrElse("Unknown")
+            catch
+              case ErrorResponse(error = ErrorStatus.NotFound) => "Succeeded"
+              case e =>
+                Logger[IO].error(s"Failed to get cleanup pod $podName: ${e.getMessage}").await
+                "Unknown"
+          phase match
+            case "Succeeded" => IO.unit
+            case "Failed"    => IO.raiseError(new Exception(s"Cleanup pod $podName failed"))
+            case _           => IO.sleep(5.seconds) *> attempt(n + 1)
+      attempt(0).await
 
   def onPodEvent(event: WatchEvent[Pod]): IO[Unit] = event match
     case WatchEvent(WatchEventType.ADDED | WatchEventType.MODIFIED, pod) =>
@@ -296,14 +406,6 @@ class Operator(client: KClient[IO])(using logger: Logger[IO]):
 
   private def getPod(resource: Torrent): Pod =
     val downloadPath = resource.spec.downloadPath.getOrElse("")
-    val cleanupLifecycle: Option[Lifecycle] =
-      Option.when(downloadPath.nonEmpty) {
-        Lifecycle(
-          preStop = LifecycleHandler(
-            exec = ExecAction(command = Seq("sh", "-c", s"cd / && rm -rf /data/$downloadPath")).some
-          ).some
-        )
-      }
     val baseContainer = Container(
       name = "torrentdam",
       image = "ghcr.io/torrentdam/cmd:latest".some,
@@ -341,7 +443,7 @@ class Operator(client: KClient[IO])(using logger: Logger[IO]):
         )
       ).some
     )
-    val container = cleanupLifecycle.fold(baseContainer)(baseContainer.withLifecycle)
+    val container = baseContainer
     val eventsContainer = Container(
       name = "events",
       image = "alpine:3.21".some,

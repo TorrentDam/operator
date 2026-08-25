@@ -12,7 +12,7 @@ rules:
     resources: ["pods"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["torrentdam.github.com"]
-    resources: ["torrents", "torrents/status"]
+    resources: ["torrents", "torrents/status", "torrents/finalizers"]
     verbs: ["get", "list", "watch", "create", "delete", "update", "patch"]
   - apiGroups: ["apiextensions.k8s.io"]
     resources: ["customresourcedefinitions"]
