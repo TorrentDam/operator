@@ -353,16 +353,22 @@ class Processor(client: KClient[IO], supervisor: Supervisor[IO], key: String, ch
     Host.fromString(dnsName) match
       case Some(host) =>
         val address = SocketAddress(host, Port.fromInt(9000).getOrElse(sys.error("invalid port")))
-        Network[IO].client(address).use { socket =>
-          socket.reads
-            .through(fs2.text.utf8.decode)
-            .through(fs2.text.lines)
-            .evalMap(line => Logger[IO].info(s"[$crName] Event: $line"))
-            .compile
-            .drain
-        }.handleErrorWith(e =>
-          Logger[IO].error(s"Events stream error for $crName: ${e.getMessage}")
-        )
+        def attempt(n: Int): IO[Unit] =
+          if n >= 60 then
+            Logger[IO].error(s"Events stream for $crName failed after 5 min of retries, giving up")
+          else
+            Network[IO].client(address).use { socket =>
+              socket.reads
+                .through(fs2.text.utf8.decode)
+                .through(fs2.text.lines)
+                .evalMap(line => Logger[IO].info(s"[$crName] Event: $line"))
+                .compile
+                .drain
+            }.handleErrorWith(e =>
+              Logger[IO].debug(s"Events stream connection attempt ${n + 1} failed for $crName: ${e.getMessage}, retrying in 5s") *>
+                IO.sleep(5.seconds) *> attempt(n + 1)
+            )
+        attempt(0)
       case None =>
         Logger[IO].error(s"Invalid DNS name for $crName: $dnsName")
 
