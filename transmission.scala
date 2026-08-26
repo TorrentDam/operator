@@ -112,8 +112,8 @@ object TransmissionServer:
         "rpc-version-minimum" -> Json.fromInt(1),
         "version" -> Json.fromString("4.0.0 (TorrentDam)"),
         "download-dir" -> Json.fromString("/"),
-        "seedRatioLimit" -> Json.fromDoubleOrNull(2.0),
-        "seedRatioLimited" -> Json.fromBoolean(false),
+        "seedRatioLimit" -> Json.fromDoubleOrNull(0.0),
+        "seedRatioLimited" -> Json.fromBoolean(true),
         "idle-seeding-limit" -> Json.fromInt(30),
         "idle-seeding-limit-enabled" -> Json.fromBoolean(false)
       )
