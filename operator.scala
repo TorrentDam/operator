@@ -250,7 +250,8 @@ enum TorrentEvent:
 
 case class ProcessorState(
     torrent: Option[Torrent] = None,
-    deleting: Boolean = false
+    deleting: Boolean = false,
+    eventsListenerStarted: Boolean = false
 )
 
 case class TorrentList(
@@ -291,17 +292,20 @@ class Processor(client: KClient[IO], supervisor: Supervisor[IO], key: String, ch
   private def handle(event: TorrentEvent, state: ProcessorState, ch: Channel[IO, TorrentEvent]): IO[ProcessorState] =
     event match
       case TorrentEvent.TorrentUpserted(t) =>
-        reconcile(t).as(state.copy(torrent = t.some))
+        for
+          _ <- reconcile(t, !state.eventsListenerStarted)
+          _ <- if !state.eventsListenerStarted then startEventsListener(t) else IO.unit
+        yield state.copy(torrent = t.some, eventsListenerStarted = true)
       case TorrentEvent.TorrentDeleted(t) =>
         onTorrentDeletion(t) *> ch.close.void *> IO.pure(state.copy(deleting = true))
       case TorrentEvent.PodStatusUpdated(podName, phase) =>
         state match
-          case ProcessorState(torrent = Some(t), deleting = false) =>
+          case ProcessorState(torrent = Some(t), deleting = false, eventsListenerStarted = _) =>
             updateStatus(t, podName, phase).as(state)
           case _ =>
             IO.pure(state)
 
-  private def reconcile(resource: Torrent): IO[Unit] = async[IO]:
+  private def reconcile(resource: Torrent, startListener: Boolean): IO[Unit] = async[IO]:
     val namespace = resource.metadata.namespace.getOrElse("default")
     val crName = resource.metadata.name.getOrElse("")
     val podName = podNameFor(resource)
@@ -315,7 +319,6 @@ class Processor(client: KClient[IO], supervisor: Supervisor[IO], key: String, ch
       case None =>
         podAPI.create(desired).send(client).await
         Logger[IO].info(s"Created pod $podName for torrent $crName").await
-        startEventsListener(resource).await
     ensureService(resource).await
     ensureFinalizer(resource).await
 
