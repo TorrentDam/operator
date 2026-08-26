@@ -294,23 +294,25 @@ class Processor(client: KClient[IO], supervisor: Supervisor[IO], key: String, na
         .drain
     }
 
-  private def handle(event: TorrentEvent, state: ProcessorState, ch: Channel[IO, TorrentEvent]): IO[ProcessorState] =
+  private def handle(event: TorrentEvent, state: ProcessorState, ch: Channel[IO, TorrentEvent]): IO[ProcessorState] = async[IO]:
     event match
       case TorrentEvent.TorrentUpserted(t) =>
-        reconcile(t).as(state.copy(torrent = t.some))
+        reconcile(t).await
+        state.copy(torrent = t.some)
       case TorrentEvent.TorrentDeleted(t) =>
-        onTorrentDeletion(t) *> ch.close.void *> IO.pure(state.copy(deleting = true))
+        onTorrentDeletion(t).await
+        ch.close.void.await
+        state.copy(deleting = true)
       case TorrentEvent.PodStatusUpdated(podName, phase) =>
         state match
           case ProcessorState(torrent = Some(t), deleting = false) =>
-            updateStatus(t, podName, phase).as(state)
+            updateStatus(t, podName, phase).await
+            state
           case _ =>
-            IO.pure(state)
+            state
 
   private def reconcile(resource: Torrent): IO[Unit] = async[IO]:
-    val namespace = resource.metadata.namespace.getOrElse("default")
     val crName = resource.metadata.name.getOrElse("")
-    val podName = podNameFor(resource)
     val podAPI = PodAPI(namespace)
     val desired = getPod(resource)
     val currentPods = podAPI.list().send(client).await
@@ -325,14 +327,13 @@ class Processor(client: KClient[IO], supervisor: Supervisor[IO], key: String, na
     ensureFinalizer(resource).await
 
   private def onTorrentDeletion(resource: Torrent): IO[Unit] = async[IO]:
-    val namespace = resource.metadata.namespace.getOrElse("default")
     val crName = resource.metadata.name.getOrElse("")
-    deleteTorrentPod(resource, namespace).await
-    deleteTorrentService(resource, namespace).await
+    deleteTorrentPod(resource).await
+    deleteTorrentService(resource).await
     resource.spec.downloadPath match
       case Some(downloadPath) if downloadPath.nonEmpty =>
         Logger[IO].info(s"Cleaning up PVC path /data/$downloadPath for torrent $crName").await
-        waitForTorrentPodTermination(resource, namespace).await
+        waitForTorrentPodTermination(resource).await
         val target = Path("/data") / downloadPath
         Files[IO].exists(target).flatMap(exists =>
           if exists then Files[IO].deleteRecursively(target)
@@ -344,19 +345,19 @@ class Processor(client: KClient[IO], supervisor: Supervisor[IO], key: String, na
       case _ =>
         removeFinalizer(resource).await
 
-  private def startEventsListener: IO[Unit] =
+  private def startEventsListener: IO[Unit] = async[IO]:
     supervisor.supervise(
       Logger[IO].info(s"Connecting to events stream for $key at $dnsName:9000") *>
         connectToEvents()
-    ).void
+    ).void.await
 
-  private def connectToEvents(): IO[Unit] =
+  private def connectToEvents(): IO[Unit] = async[IO]:
     Host.fromString(dnsName) match
       case Some(host) =>
         val address = SocketAddress(host, Port.fromInt(9000).getOrElse(sys.error("invalid port")))
-        def attempt(n: Int): IO[Unit] =
+        def attempt(n: Int): IO[Unit] = async[IO]:
           if n >= 60 then
-            Logger[IO].error(s"Events stream for $key failed after 5 min of retries, giving up")
+            Logger[IO].error(s"Events stream for $key failed after 5 min of retries, giving up").await
           else
             Network[IO].client(address).use { socket =>
               socket.reads
@@ -368,13 +369,12 @@ class Processor(client: KClient[IO], supervisor: Supervisor[IO], key: String, na
             }.handleErrorWith(e =>
               Logger[IO].debug(s"Events stream connection attempt ${n + 1} failed for $key: ${e.getMessage}, retrying in 5s") *>
                 IO.sleep(5.seconds) *> attempt(n + 1)
-            )
-        attempt(0)
+            ).await
+        attempt(0).await
       case None =>
-        Logger[IO].error(s"Invalid DNS name for $key: $dnsName")
+        Logger[IO].error(s"Invalid DNS name for $key: $dnsName").await
 
   private def ensureService(resource: Torrent): IO[Unit] = async[IO]:
-    val namespace = resource.metadata.namespace.getOrElse("default")
     val serviceName = serviceNameFor(resource)
     val serviceAPI = ServiceAPI(namespace)
     try
@@ -385,7 +385,7 @@ class Processor(client: KClient[IO], supervisor: Supervisor[IO], key: String, na
         serviceAPI.create(getService(resource)).send(client).await
         Logger[IO].info(s"Created service $serviceName for torrent ${resource.metadata.name.getOrElse("")}").await
 
-  private def deleteTorrentService(resource: Torrent, namespace: String): IO[Unit] = async[IO]:
+  private def deleteTorrentService(resource: Torrent): IO[Unit] = async[IO]:
     val serviceName = serviceNameFor(resource)
     val serviceAPI = ServiceAPI(namespace)
     try
@@ -399,7 +399,6 @@ class Processor(client: KClient[IO], supervisor: Supervisor[IO], key: String, na
     podNameFor(resource)
 
   private def getService(resource: Torrent): Service =
-    val namespace = resource.metadata.namespace.getOrElse("default")
     Service(
       metadata = ObjectMeta(
         name = serviceNameFor(resource).some,
@@ -435,7 +434,7 @@ class Processor(client: KClient[IO], supervisor: Supervisor[IO], key: String, na
       ).some
     )
 
-  private def deleteTorrentPod(resource: Torrent, namespace: String): IO[Unit] = async[IO]:
+  private def deleteTorrentPod(resource: Torrent): IO[Unit] = async[IO]:
     val podName = podNameFor(resource)
     val podAPI = PodAPI(namespace)
     try
@@ -445,12 +444,12 @@ class Processor(client: KClient[IO], supervisor: Supervisor[IO], key: String, na
       case ErrorResponse(error = ErrorStatus.NotFound) =>
         Logger[IO].debug(s"Torrent pod $podName already gone").await
 
-  private def waitForTorrentPodTermination(resource: Torrent, namespace: String): IO[Unit] =
+  private def waitForTorrentPodTermination(resource: Torrent): IO[Unit] = async[IO]:
     val podName = podNameFor(resource)
     val podAPI = PodAPI(namespace)
-    def attempt(n: Int): IO[Unit] =
+    def attempt(n: Int): IO[Unit] = async[IO]:
       if n >= 120 then
-        Logger[IO].warn(s"Torrent pod $podName still present after 10 min, proceeding with cleanup")
+        Logger[IO].warn(s"Torrent pod $podName still present after 10 min, proceeding with cleanup").await
       else
         podAPI.get(podName).send(client).attempt.flatMap:
           case Right(pod) =>
@@ -464,10 +463,10 @@ class Processor(client: KClient[IO], supervisor: Supervisor[IO], key: String, na
           case Left(e) =>
             Logger[IO].error(s"Failed to get torrent pod $podName: ${e.getMessage}") *>
               IO.sleep(5.seconds) *> attempt(n + 1)
-    attempt(0)
+        .await
+    attempt(0).await
 
   private def ensureFinalizer(resource: Torrent): IO[Unit] = async[IO]:
-    val namespace = resource.metadata.namespace.getOrElse("default")
     val crName = resource.metadata.name.getOrElse("")
     val hasFinalizer = resource.metadata.finalizers.exists(_.contains(finalizerName))
     val needsFinalizer = resource.spec.downloadPath.exists(_.nonEmpty)
@@ -478,7 +477,6 @@ class Processor(client: KClient[IO], supervisor: Supervisor[IO], key: String, na
       Logger[IO].info(s"Added finalizer to torrent $crName").await
 
   private def removeFinalizer(resource: Torrent): IO[Unit] = async[IO]:
-    val namespace = resource.metadata.namespace.getOrElse("default")
     val crName = resource.metadata.name.getOrElse("")
     val torrentAPI = TorrentAPI(namespace)
     val finalizers = resource.metadata.finalizers.getOrElse(Nil).filterNot(_ == finalizerName)
@@ -487,7 +485,6 @@ class Processor(client: KClient[IO], supervisor: Supervisor[IO], key: String, na
 
   private def updateStatus(resource: Torrent, podName: String, phase: String): IO[Unit] =
     async[IO]:
-      val namespace = resource.metadata.namespace.getOrElse("default")
       val crName = resource.metadata.name.getOrElse("")
       val torrentAPI = TorrentAPI(namespace)
       val torrentStatus = TorrentStatus(phase = phase, podName = podName.some)
