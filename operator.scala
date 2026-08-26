@@ -67,8 +67,8 @@ object OperatorApp extends IOApp.Simple:
     Supervisor[IO].use { supervisor =>
       async[IO]:
         registerCustomResource(client).await
-        val registry = ProcessorRegistry(supervisor, client)
         val namespace = sys.env.get("WATCH_NAMESPACE")
+        val registry = ProcessorRegistry(supervisor, client, namespace.getOrElse("default"))
         val torrentEvents = watchStream:
           namespace match
             case Some(ns) => new TorrentAPI(ns).list().listen(client)
@@ -250,8 +250,7 @@ enum TorrentEvent:
 
 case class ProcessorState(
     torrent: Option[Torrent] = None,
-    deleting: Boolean = false,
-    eventsListenerStarted: Boolean = false
+    deleting: Boolean = false
 )
 
 case class TorrentList(
@@ -279,33 +278,36 @@ object TorrentAPI
 class TorrentAPI(val namespace: String = "default") extends TorrentAPI.NamespacedAPIBuilders
 object TorrentClusterAPI extends TorrentAPI.ClusterwideAPIBuilders
 
-class Processor(client: KClient[IO], supervisor: Supervisor[IO], key: String, channel: Channel[IO, TorrentEvent])(using logger: Logger[IO]):
+class Processor(client: KClient[IO], supervisor: Supervisor[IO], key: String, namespace: String, channel: Channel[IO, TorrentEvent])(using logger: Logger[IO]):
 
   private val finalizerName = "torrentdam.github.com/pvc-cleanup"
+  private val podName = s"torrentdam-torrent-${key.take(10)}"
+  private val serviceName = podName
+  private val dnsName = s"$serviceName.$namespace.svc.cluster.local"
 
   def run: IO[Unit] =
-    channel.stream
-      .evalFold(ProcessorState())((state, event) => handle(event, state, channel))
-      .compile
-      .drain
+    val listener = startEventsListener
+    listener.background.surround {
+      channel.stream
+        .evalFold(ProcessorState())((state, event) => handle(event, state, channel))
+        .compile
+        .drain
+    }
 
   private def handle(event: TorrentEvent, state: ProcessorState, ch: Channel[IO, TorrentEvent]): IO[ProcessorState] =
     event match
       case TorrentEvent.TorrentUpserted(t) =>
-        for
-          _ <- reconcile(t, !state.eventsListenerStarted)
-          _ <- if !state.eventsListenerStarted then startEventsListener(t) else IO.unit
-        yield state.copy(torrent = t.some, eventsListenerStarted = true)
+        reconcile(t).as(state.copy(torrent = t.some))
       case TorrentEvent.TorrentDeleted(t) =>
         onTorrentDeletion(t) *> ch.close.void *> IO.pure(state.copy(deleting = true))
       case TorrentEvent.PodStatusUpdated(podName, phase) =>
         state match
-          case ProcessorState(torrent = Some(t), deleting = false, eventsListenerStarted = _) =>
+          case ProcessorState(torrent = Some(t), deleting = false) =>
             updateStatus(t, podName, phase).as(state)
           case _ =>
             IO.pure(state)
 
-  private def reconcile(resource: Torrent, startListener: Boolean): IO[Unit] = async[IO]:
+  private def reconcile(resource: Torrent): IO[Unit] = async[IO]:
     val namespace = resource.metadata.namespace.getOrElse("default")
     val crName = resource.metadata.name.getOrElse("")
     val podName = podNameFor(resource)
@@ -342,38 +344,34 @@ class Processor(client: KClient[IO], supervisor: Supervisor[IO], key: String, ch
       case _ =>
         removeFinalizer(resource).await
 
-  private def startEventsListener(resource: Torrent): IO[Unit] =
-    val namespace = resource.metadata.namespace.getOrElse("default")
-    val crName = resource.metadata.name.getOrElse("")
-    val serviceName = serviceNameFor(resource)
-    val dnsName = s"$serviceName.$namespace.svc.cluster.local"
+  private def startEventsListener: IO[Unit] =
     supervisor.supervise(
-      Logger[IO].info(s"Connecting to events stream for $crName at $dnsName:9000") *>
-        connectToEvents(dnsName, crName)
+      Logger[IO].info(s"Connecting to events stream for $key at $dnsName:9000") *>
+        connectToEvents()
     ).void
 
-  private def connectToEvents(dnsName: String, crName: String): IO[Unit] =
+  private def connectToEvents(): IO[Unit] =
     Host.fromString(dnsName) match
       case Some(host) =>
         val address = SocketAddress(host, Port.fromInt(9000).getOrElse(sys.error("invalid port")))
         def attempt(n: Int): IO[Unit] =
           if n >= 60 then
-            Logger[IO].error(s"Events stream for $crName failed after 5 min of retries, giving up")
+            Logger[IO].error(s"Events stream for $key failed after 5 min of retries, giving up")
           else
             Network[IO].client(address).use { socket =>
               socket.reads
                 .through(fs2.text.utf8.decode)
                 .through(fs2.text.lines)
-                .evalMap(line => Logger[IO].info(s"[$crName] Event: $line"))
+                .evalMap(line => Logger[IO].info(s"[$key] Event: $line"))
                 .compile
                 .drain
             }.handleErrorWith(e =>
-              Logger[IO].debug(s"Events stream connection attempt ${n + 1} failed for $crName: ${e.getMessage}, retrying in 5s") *>
+              Logger[IO].debug(s"Events stream connection attempt ${n + 1} failed for $key: ${e.getMessage}, retrying in 5s") *>
                 IO.sleep(5.seconds) *> attempt(n + 1)
             )
         attempt(0)
       case None =>
-        Logger[IO].error(s"Invalid DNS name for $crName: $dnsName")
+        Logger[IO].error(s"Invalid DNS name for $key: $dnsName")
 
   private def ensureService(resource: Torrent): IO[Unit] = async[IO]:
     val namespace = resource.metadata.namespace.getOrElse("default")
@@ -618,7 +616,7 @@ class Processor(client: KClient[IO], supervisor: Supervisor[IO], key: String, ch
 
 end Processor
 
-final class ProcessorRegistry(supervisor: Supervisor[IO], client: KClient[IO])(using logger: Logger[IO]):
+final class ProcessorRegistry(supervisor: Supervisor[IO], client: KClient[IO], namespace: String)(using logger: Logger[IO]):
 
   private val processors: Ref[IO, Map[String, Channel[IO, TorrentEvent]]] =
     Ref.unsafe(Map.empty)
@@ -637,7 +635,7 @@ final class ProcessorRegistry(supervisor: Supervisor[IO], client: KClient[IO])(u
 
   private def spawnProcessor(key: String): IO[Channel[IO, TorrentEvent]] =
     Channel.bounded[IO, TorrentEvent](1024).flatMap { ch =>
-      val processor = Processor(client, supervisor, key, ch)
+      val processor = Processor(client, supervisor, key, namespace, ch)
       supervisor.supervise(processor.run).as(ch)
     }.flatMap { ch =>
       processors.update(_.updated(key, ch)).as(ch)
