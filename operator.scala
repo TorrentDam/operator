@@ -7,7 +7,7 @@ import cats.effect.std.Supervisor
 import cats.syntax.all.given
 import cats.Eq
 import dev.hnaderi.k8s.circe.*
-import dev.hnaderi.k8s.client.apis.corev1.{ClusterPodAPI, PodAPI}
+import dev.hnaderi.k8s.client.apis.corev1.{ClusterPodAPI, ClusterServiceAPI, PodAPI, ServiceAPI}
 import dev.hnaderi.k8s.client.apis.api_extensions.CustomResourceAPI
 import dev.hnaderi.k8s.client.http4s.EmberKubernetesClient
 import dev.hnaderi.k8s.client.http4s.KClient
@@ -16,9 +16,12 @@ import dev.hnaderi.k8s.implicits.convertToOption
 import dev.hnaderi.k8s.utils.*
 import dev.hnaderi.yaml4s.SnakeYaml
 import dev.hnaderi.yaml4s.YAML
+import com.comcast.ip4s.{Host, Port, SocketAddress}
 import fs2.Stream
 import fs2.concurrent.Channel
 import fs2.io.file.{Files, Path}
+import fs2.io.net.Network
+import fs2.text
 import io.circe.Json
 import io.k8s.api.core.v1.Container
 import io.k8s.api.core.v1.ContainerPort
@@ -28,8 +31,12 @@ import io.k8s.api.core.v1.PersistentVolumeClaimVolumeSource
 import io.k8s.api.core.v1.Pod
 import io.k8s.api.core.v1.PodSpec
 import io.k8s.api.core.v1.ResourceRequirements
+import io.k8s.api.core.v1.Service
+import io.k8s.api.core.v1.ServicePort
+import io.k8s.api.core.v1.ServiceSpec
 import io.k8s.api.core.v1.Volume
 import io.k8s.api.core.v1.VolumeMount
+import io.k8s.apimachinery.pkg.util.intstr.IntOrString
 import io.k8s.apiextensions_apiserver.pkg.apis.apiextensions.v1.CustomResourceDefinition
 import io.k8s.apimachinery.pkg.api.resource.Quantity
 import io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta
@@ -60,8 +67,7 @@ object OperatorApp extends IOApp.Simple:
     Supervisor[IO].use { supervisor =>
       async[IO]:
         registerCustomResource(client).await
-        val operator = Operator(client)
-        val registry = ProcessorRegistry(supervisor, operator)
+        val registry = ProcessorRegistry(supervisor, client)
         val namespace = sys.env.get("WATCH_NAMESPACE")
         val torrentEvents = watchStream:
           namespace match
@@ -272,16 +278,22 @@ object TorrentAPI
 class TorrentAPI(val namespace: String = "default") extends TorrentAPI.NamespacedAPIBuilders
 object TorrentClusterAPI extends TorrentAPI.ClusterwideAPIBuilders
 
-class Operator(client: KClient[IO])(using logger: Logger[IO]):
+class Processor(client: KClient[IO], supervisor: Supervisor[IO], key: String, channel: Channel[IO, TorrentEvent])(using logger: Logger[IO]):
 
   private val finalizerName = "torrentdam.github.com/pvc-cleanup"
 
-  def handle(event: TorrentEvent, state: ProcessorState, channel: Channel[IO, TorrentEvent]): IO[ProcessorState] =
+  def run: IO[Unit] =
+    channel.stream
+      .evalFold(ProcessorState())((state, event) => handle(event, state, channel))
+      .compile
+      .drain
+
+  private def handle(event: TorrentEvent, state: ProcessorState, ch: Channel[IO, TorrentEvent]): IO[ProcessorState] =
     event match
       case TorrentEvent.TorrentUpserted(t) =>
-        reconcile(t) *> IO.pure(state.copy(torrent = t.some))
+        reconcile(t).as(state.copy(torrent = t.some))
       case TorrentEvent.TorrentDeleted(t) =>
-        onTorrentDeletion(t) *> channel.close.void *> IO.pure(state.copy(deleting = true))
+        onTorrentDeletion(t) *> ch.close.void *> IO.pure(state.copy(deleting = true))
       case TorrentEvent.PodStatusUpdated(podName, phase) =>
         state match
           case ProcessorState(torrent = Some(t), deleting = false) =>
@@ -289,7 +301,7 @@ class Operator(client: KClient[IO])(using logger: Logger[IO]):
           case _ =>
             IO.pure(state)
 
-  def reconcile(resource: Torrent): IO[Unit] = async[IO]:
+  private def reconcile(resource: Torrent): IO[Unit] = async[IO]:
     val namespace = resource.metadata.namespace.getOrElse("default")
     val crName = resource.metadata.name.getOrElse("")
     val podName = podNameFor(resource)
@@ -303,12 +315,15 @@ class Operator(client: KClient[IO])(using logger: Logger[IO]):
       case None =>
         podAPI.create(desired).send(client).await
         Logger[IO].info(s"Created pod $podName for torrent $crName").await
+        startEventsListener(resource).await
+    ensureService(resource).await
     ensureFinalizer(resource).await
 
-  def onTorrentDeletion(resource: Torrent): IO[Unit] = async[IO]:
+  private def onTorrentDeletion(resource: Torrent): IO[Unit] = async[IO]:
     val namespace = resource.metadata.namespace.getOrElse("default")
     val crName = resource.metadata.name.getOrElse("")
     deleteTorrentPod(resource, namespace).await
+    deleteTorrentService(resource, namespace).await
     resource.spec.downloadPath match
       case Some(downloadPath) if downloadPath.nonEmpty =>
         Logger[IO].info(s"Cleaning up PVC path /data/$downloadPath for torrent $crName").await
@@ -323,6 +338,95 @@ class Operator(client: KClient[IO])(using logger: Logger[IO]):
         Logger[IO].info(s"Cleanup complete, finalizer removed for torrent $crName").await
       case _ =>
         removeFinalizer(resource).await
+
+  private def startEventsListener(resource: Torrent): IO[Unit] =
+    val namespace = resource.metadata.namespace.getOrElse("default")
+    val crName = resource.metadata.name.getOrElse("")
+    val serviceName = serviceNameFor(resource)
+    val dnsName = s"$serviceName.$namespace.svc.cluster.local"
+    supervisor.supervise(
+      Logger[IO].info(s"Connecting to events stream for $crName at $dnsName:9000") *>
+        connectToEvents(dnsName, crName)
+    ).void
+
+  private def connectToEvents(dnsName: String, crName: String): IO[Unit] =
+    Host.fromString(dnsName) match
+      case Some(host) =>
+        val address = SocketAddress(host, Port.fromInt(9000).getOrElse(sys.error("invalid port")))
+        Network[IO].client(address).use { socket =>
+          socket.reads
+            .through(fs2.text.utf8.decode)
+            .through(fs2.text.lines)
+            .evalMap(line => Logger[IO].info(s"[$crName] Event: $line"))
+            .compile
+            .drain
+        }.handleErrorWith(e =>
+          Logger[IO].error(s"Events stream error for $crName: ${e.getMessage}")
+        )
+      case None =>
+        Logger[IO].error(s"Invalid DNS name for $crName: $dnsName")
+
+  private def ensureService(resource: Torrent): IO[Unit] = async[IO]:
+    val namespace = resource.metadata.namespace.getOrElse("default")
+    val serviceName = serviceNameFor(resource)
+    val serviceAPI = ServiceAPI(namespace)
+    try
+      serviceAPI.get(serviceName).send(client).await
+      Logger[IO].debug(s"Service $serviceName already exists").await
+    catch
+      case ErrorResponse(error = ErrorStatus.NotFound) =>
+        serviceAPI.create(getService(resource)).send(client).await
+        Logger[IO].info(s"Created service $serviceName for torrent ${resource.metadata.name.getOrElse("")}").await
+
+  private def deleteTorrentService(resource: Torrent, namespace: String): IO[Unit] = async[IO]:
+    val serviceName = serviceNameFor(resource)
+    val serviceAPI = ServiceAPI(namespace)
+    try
+      serviceAPI.delete(serviceName).send(client).void.await
+      Logger[IO].info(s"Deleted torrent service $serviceName").await
+    catch
+      case ErrorResponse(error = ErrorStatus.NotFound) =>
+        Logger[IO].debug(s"Torrent service $serviceName already gone").await
+
+  private def serviceNameFor(resource: Torrent): String =
+    podNameFor(resource)
+
+  private def getService(resource: Torrent): Service =
+    val namespace = resource.metadata.namespace.getOrElse("default")
+    Service(
+      metadata = ObjectMeta(
+        name = serviceNameFor(resource).some,
+        namespace = namespace.some,
+        labels = Map(
+          "app" -> "torrentdam",
+          "torrent" -> resource.metadata.name.getOrElse("")
+        ).some,
+        ownerReferences = Seq(
+          OwnerReference(
+            apiVersion = "torrentdam.github.com/v1",
+            kind = "Torrent",
+            name = resource.metadata.name.getOrElse(""),
+            uid = resource.metadata.uid.getOrElse(""),
+            controller = true.some,
+            blockOwnerDeletion = true.some
+          )
+        ).some
+      ).some,
+      spec = ServiceSpec(
+        `type` = "ClusterIP".some,
+        selector = Map(
+          "app" -> "torrentdam",
+          "torrent" -> resource.metadata.name.getOrElse("")
+        ).some,
+        ports = Seq(
+          ServicePort(
+            port = 9000,
+            name = "events".some,
+            targetPort = IntOrString(9000).some
+          )
+        ).some
+      ).some
+    )
 
   private def deleteTorrentPod(resource: Torrent, namespace: String): IO[Unit] = async[IO]:
     val podName = podNameFor(resource)
@@ -503,9 +607,9 @@ class Operator(client: KClient[IO])(using logger: Logger[IO]):
       ).some
     )
 
-end Operator
+end Processor
 
-final class ProcessorRegistry(supervisor: Supervisor[IO], operator: Operator)(using logger: Logger[IO]):
+final class ProcessorRegistry(supervisor: Supervisor[IO], client: KClient[IO])(using logger: Logger[IO]):
 
   private val processors: Ref[IO, Map[String, Channel[IO, TorrentEvent]]] =
     Ref.unsafe(Map.empty)
@@ -524,11 +628,8 @@ final class ProcessorRegistry(supervisor: Supervisor[IO], operator: Operator)(us
 
   private def spawnProcessor(key: String): IO[Channel[IO, TorrentEvent]] =
     Channel.bounded[IO, TorrentEvent](1024).flatMap { ch =>
-      val run = ch.stream
-        .evalFold(ProcessorState())((state, event) => operator.handle(event, state, ch))
-        .compile
-        .drain
-      supervisor.supervise(run).as(ch)
+      val processor = Processor(client, supervisor, key, ch)
+      supervisor.supervise(processor.run).as(ch)
     }.flatMap { ch =>
       processors.update(_.updated(key, ch)).as(ch)
     }

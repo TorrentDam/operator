@@ -9,7 +9,7 @@ metadata:
   name: torrentdam-operator
 rules:
   - apiGroups: [""]
-    resources: ["pods"]
+    resources: ["pods", "services"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["torrentdam.github.com"]
     resources: ["torrents", "torrents/status", "torrents/finalizers"]
