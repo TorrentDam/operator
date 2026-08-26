@@ -1,7 +1,9 @@
 import cats.effect.direct.*
 import cats.effect.IO
 import cats.effect.IOApp
+import cats.effect.Ref
 import cats.effect.Resource
+import cats.effect.std.Supervisor
 import cats.syntax.all.given
 import cats.Eq
 import dev.hnaderi.k8s.circe.*
@@ -15,6 +17,7 @@ import dev.hnaderi.k8s.utils.*
 import dev.hnaderi.yaml4s.SnakeYaml
 import dev.hnaderi.yaml4s.YAML
 import fs2.Stream
+import fs2.concurrent.Channel
 import fs2.io.file.{Files, Path}
 import io.circe.Json
 import io.k8s.api.core.v1.Container
@@ -54,33 +57,56 @@ object OperatorApp extends IOApp.Simple:
 
   def operatorLogic(client: KClient[IO], logger: Logger[IO]): IO[Unit] =
     given Logger[IO] = logger
-    async[IO]:
-      registerCustomResource(client).await
-      val operator = Operator(client)
-      val namespace = sys.env.get("WATCH_NAMESPACE")
-      val torrentEvents = watchStream:
-        namespace match
-          case Some(ns) => new TorrentAPI(ns).list().listen(client)
-          case None    => TorrentClusterAPI.list().listen(client)
-      val podEvents = watchStream:
-        namespace match
-          case Some(ns) => PodAPI(ns).list().listen(client)
-          case None    => ClusterPodAPI.list().listen(client)
-      val ops = OperatorTorrentOps(client, namespace.getOrElse("default"))
-      val httpServer = TransmissionServer.stream(ops, 9091)
-      torrentEvents
-        .evalTap:
+    Supervisor[IO].use { supervisor =>
+      async[IO]:
+        registerCustomResource(client).await
+        val operator = Operator(client)
+        val registry = ProcessorRegistry(supervisor, operator)
+        val namespace = sys.env.get("WATCH_NAMESPACE")
+        val torrentEvents = watchStream:
+          namespace match
+            case Some(ns) => new TorrentAPI(ns).list().listen(client)
+            case None    => TorrentClusterAPI.list().listen(client)
+        val podEvents = watchStream:
+          namespace match
+            case Some(ns) => PodAPI(ns).list().listen(client)
+            case None    => ClusterPodAPI.list().listen(client)
+        val ops = OperatorTorrentOps(client, namespace.getOrElse("default"))
+        val httpServer = TransmissionServer.stream(ops, 9091)
+
+        val torrentEventStream = torrentEvents.evalMap:
           case WatchEvent(WatchEventType.ADDED | WatchEventType.MODIFIED, torrent) =>
             if torrent.metadata.deletionTimestamp.isDefined then
-              operator.onTorrentDeletion(torrent)
+              registry.getForId(torrent.metadata.name.getOrElse("")).flatMap(
+                _.send(TorrentEvent.TorrentDeleted(torrent)).void
+              )
             else
-              operator.reconcile(torrent)
+              registry.getForId(torrent.metadata.name.getOrElse("")).flatMap(
+                _.send(TorrentEvent.TorrentUpserted(torrent)).void
+              )
           case _ => IO.unit
-        .merge(podEvents.evalTap(operator.onPodEvent))
-        .merge(httpServer)
-        .compile
-        .drain
-        .await
+
+        val podEventStream = podEvents.evalMap:
+          case WatchEvent(WatchEventType.ADDED | WatchEventType.MODIFIED, pod) =>
+            val isTorrentPod = pod.metadata.exists(_.labels.exists(_.get("app").contains("torrentdam")))
+            if isTorrentPod then
+              val crName = pod.metadata.flatMap(_.labels).flatMap(_.get("torrent"))
+              val podName = pod.metadata.flatMap(_.name).getOrElse("")
+              val phase = pod.status.flatMap(_.phase).getOrElse("Unknown")
+              crName match
+                case Some(c) =>
+                  registry.getForId(c).flatMap(_.send(TorrentEvent.PodStatusUpdated(podName, phase)).void)
+                case None => IO.unit
+            else IO.unit
+          case _ => IO.unit
+
+        torrentEventStream
+          .merge(podEventStream)
+          .merge(httpServer)
+          .compile
+          .drain
+          .await
+    }
 
   def watchStream[A](stream: => Stream[IO, A])(using logger: Logger[IO]): Stream[IO, A] =
     Stream.eval(Logger[IO].info("Starting watch stream")).flatMap(_ => stream) ++
@@ -211,6 +237,16 @@ object Torrent {
   }
 }
 
+enum TorrentEvent:
+  case TorrentUpserted(torrent: Torrent)
+  case TorrentDeleted(torrent: Torrent)
+  case PodStatusUpdated(podName: String, phase: String)
+
+case class ProcessorState(
+    torrent: Option[Torrent] = None,
+    deleting: Boolean = false
+)
+
 case class TorrentList(
   items: Seq[Torrent]
 )
@@ -239,6 +275,19 @@ object TorrentClusterAPI extends TorrentAPI.ClusterwideAPIBuilders
 class Operator(client: KClient[IO])(using logger: Logger[IO]):
 
   private val finalizerName = "torrentdam.github.com/pvc-cleanup"
+
+  def handle(event: TorrentEvent, state: ProcessorState, channel: Channel[IO, TorrentEvent]): IO[ProcessorState] =
+    event match
+      case TorrentEvent.TorrentUpserted(t) =>
+        reconcile(t) *> IO.pure(state.copy(torrent = t.some))
+      case TorrentEvent.TorrentDeleted(t) =>
+        onTorrentDeletion(t) *> channel.close.void *> IO.pure(state.copy(deleting = true))
+      case TorrentEvent.PodStatusUpdated(podName, phase) =>
+        state match
+          case ProcessorState(torrent = Some(t), deleting = false) =>
+            updateStatus(t, podName, phase).as(state)
+          case _ =>
+            IO.pure(state)
 
   def reconcile(resource: Torrent): IO[Unit] = async[IO]:
     val namespace = resource.metadata.namespace.getOrElse("default")
@@ -313,8 +362,7 @@ class Operator(client: KClient[IO])(using logger: Logger[IO]):
     val needsFinalizer = resource.spec.downloadPath.exists(_.nonEmpty)
     if needsFinalizer && !hasFinalizer then
       val torrentAPI = TorrentAPI(namespace)
-      val current = torrentAPI.get(crName).send(client).await
-      val updated = current.copy(metadata = current.metadata.addFinalizers(finalizerName))
+      val updated = resource.copy(metadata = resource.metadata.addFinalizers(finalizerName))
       torrentAPI.replace(crName, updated).send(client).void.await
       Logger[IO].info(s"Added finalizer to torrent $crName").await
 
@@ -326,31 +374,11 @@ class Operator(client: KClient[IO])(using logger: Logger[IO]):
     val updated = resource.copy(metadata = resource.metadata.withFinalizers(finalizers))
     torrentAPI.replace(crName, updated).send(client).void.await
 
-  def onPodEvent(event: WatchEvent[Pod]): IO[Unit] = event match
-    case WatchEvent(WatchEventType.ADDED | WatchEventType.MODIFIED, pod) =>
-      val isTorrentPod = pod.metadata.exists(_.labels.exists(_.get("app").contains("torrentdam")))
-      if isTorrentPod then
-        val ns = pod.metadata.flatMap(_.namespace)
-        val podName = pod.metadata.flatMap(_.name)
-        val crName = pod.metadata.flatMap(_.labels).flatMap(_.get("torrent"))
-        (ns, podName, crName).mapN((n, p, c) => updateStatusByName(n, p, c).void)
-          .getOrElse(IO.unit)
-      else IO.unit
-    case _ => IO.unit
-
-  private def updateStatusByName(namespace: String, podName: String, crName: String): IO[Unit] =
+  private def updateStatus(resource: Torrent, podName: String, phase: String): IO[Unit] =
     async[IO]:
-      val podAPI = PodAPI(namespace)
+      val namespace = resource.metadata.namespace.getOrElse("default")
+      val crName = resource.metadata.name.getOrElse("")
       val torrentAPI = TorrentAPI(namespace)
-      val phase =
-        try
-          val pod = podAPI.get(podName).send(client).await
-          pod.status.flatMap(_.phase).getOrElse("Unknown")
-        catch
-          case ErrorResponse(error = ErrorStatus.NotFound) => "Unknown"
-          case e =>
-            Logger[IO].error(s"Failed to get pod $podName: ${e.getMessage}").await
-            "Unknown"
       val torrentStatus = TorrentStatus(phase = phase, podName = podName.some)
       try
         val current = torrentAPI.get(crName).send(client).await
@@ -362,9 +390,6 @@ class Operator(client: KClient[IO])(using logger: Logger[IO]):
       catch
         case ErrorResponse(error = ErrorStatus.NotFound) =>
           Logger[IO].warn(s"Torrent not found, skipping status update: $crName").await
-        case e =>
-          Logger[IO].error(s"Failed to update status for $crName: ${e.getMessage}").await
-          throw e
 
   private def podNameFor(resource: Torrent): String =
     val prefix = resource.spec.infoHash.toLowerCase.take(10)
@@ -479,6 +504,36 @@ class Operator(client: KClient[IO])(using logger: Logger[IO]):
     )
 
 end Operator
+
+final class ProcessorRegistry(supervisor: Supervisor[IO], operator: Operator)(using logger: Logger[IO]):
+
+  private val processors: Ref[IO, Map[String, Channel[IO, TorrentEvent]]] =
+    Ref.unsafe(Map.empty)
+
+  def getForId(key: String): IO[Channel[IO, TorrentEvent]] =
+    processors.get.flatMap { map =>
+      map.get(key) match
+        case Some(ch) =>
+          ch.isClosed.flatMap {
+            case false => IO.pure(ch)
+            case true  => spawnProcessor(key)
+          }
+        case None =>
+          spawnProcessor(key)
+    }
+
+  private def spawnProcessor(key: String): IO[Channel[IO, TorrentEvent]] =
+    Channel.bounded[IO, TorrentEvent](1024).flatMap { ch =>
+      val run = ch.stream
+        .evalFold(ProcessorState())((state, event) => operator.handle(event, state, ch))
+        .compile
+        .drain
+      supervisor.supervise(run).as(ch)
+    }.flatMap { ch =>
+      processors.update(_.updated(key, ch)).as(ch)
+    }
+
+end ProcessorRegistry
 
 object OperatorTorrentOps:
   def apply(client: KClient[IO], namespace: String)(using logger: Logger[IO]): TorrentOps[IO] =
