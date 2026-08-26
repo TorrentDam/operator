@@ -77,7 +77,7 @@ object OperatorApp extends IOApp.Simple:
           namespace match
             case Some(ns) => PodAPI(ns).list().listen(client)
             case None    => ClusterPodAPI.list().listen(client)
-        val ops = OperatorTorrentOps(client, namespace.getOrElse("default"))
+        val ops = OperatorTorrentOps(client, namespace.getOrElse("default"), registry)
         val httpServer = TransmissionServer.stream(ops, 9091)
 
         val torrentEventStream = torrentEvents.evalMap:
@@ -248,6 +248,21 @@ enum TorrentEvent:
   case TorrentDeleted(torrent: Torrent)
   case PodStatusUpdated(podName: String, phase: String)
 
+enum DownloadEvent:
+  case MetadataReceived(name: String, pieceLength: Long, totalPieces: Long, totalSize: Long)
+  case PieceDownloaded(index: Long)
+
+case class DownloadState(
+    name: Option[String] = None,
+    pieceLength: Long = 0,
+    totalPieces: Long = 0,
+    totalSize: Long = 0,
+    downloadedPieces: Long = 0
+):
+  def downloadedBytes: Long = downloadedPieces * pieceLength
+  def leftUntilDone: Long = math.max(0, totalSize - downloadedBytes)
+  def isFinished: Boolean = totalPieces > 0 && downloadedPieces >= totalPieces
+
 case class ProcessorState(
     torrent: Option[Torrent] = None,
     deleting: Boolean = false
@@ -278,12 +293,13 @@ object TorrentAPI
 class TorrentAPI(val namespace: String = "default") extends TorrentAPI.NamespacedAPIBuilders
 object TorrentClusterAPI extends TorrentAPI.ClusterwideAPIBuilders
 
-class Processor(client: KClient[IO], supervisor: Supervisor[IO], key: String, namespace: String, channel: Channel[IO, TorrentEvent])(using logger: Logger[IO]):
+class Processor(val channel: Channel[IO, TorrentEvent], client: KClient[IO], supervisor: Supervisor[IO], key: String, namespace: String)(using logger: Logger[IO]):
 
   private val finalizerName = "torrentdam.github.com/pvc-cleanup"
   private val podName = s"torrentdam-torrent-${key.take(10)}"
   private val serviceName = podName
   private val dnsName = s"$serviceName.$namespace.svc.cluster.local"
+  val downloadState: Ref[IO, DownloadState] = Ref.unsafe(DownloadState())
 
   def run: IO[Unit] =
     val listener = startEventsListener
@@ -363,7 +379,14 @@ class Processor(client: KClient[IO], supervisor: Supervisor[IO], key: String, na
               socket.reads
                 .through(fs2.text.utf8.decode)
                 .through(fs2.text.lines)
-                .evalMap(line => Logger[IO].info(s"[$key] Event: $line"))
+                .evalMap { line =>
+                  parseEvent(line) match
+                    case Some(event) =>
+                      Logger[IO].debug(s"[$key] Event: $line") *>
+                        applyEvent(event)
+                    case None =>
+                      Logger[IO].warn(s"[$key] Unparseable event: $line")
+                }
                 .compile
                 .drain
             }.handleErrorWith(e =>
@@ -373,6 +396,29 @@ class Processor(client: KClient[IO], supervisor: Supervisor[IO], key: String, na
         attempt(0).await
       case None =>
         Logger[IO].error(s"Invalid DNS name for $key: $dnsName").await
+
+  private def parseEvent(line: String): Option[DownloadEvent] =
+    io.circe.parser.parse(line).toOption.flatMap { json =>
+      val tpe = json.hcursor.get[String]("type").getOrElse("")
+      val payload = json.hcursor.downField("payload")
+      tpe match
+        case "TorrentMetadata" =>
+          for
+            name <- payload.get[String]("name").toOption
+            pieceLength <- payload.get[Long]("pieceLength").toOption
+            totalPieces <- payload.get[Long]("totalPieces").toOption
+            totalSize <- payload.get[Long]("totalSize").toOption
+          yield DownloadEvent.MetadataReceived(name, pieceLength, totalPieces, totalSize)
+        case "PieceDownloaded" =>
+          payload.get[Long]("index").toOption.map(DownloadEvent.PieceDownloaded.apply)
+        case _ => None
+    }
+
+  private def applyEvent(event: DownloadEvent): IO[Unit] = event match
+    case DownloadEvent.MetadataReceived(name, pieceLength, totalPieces, totalSize) =>
+      downloadState.set(DownloadState(name = name.some, pieceLength = pieceLength, totalPieces = totalPieces, totalSize = totalSize))
+    case DownloadEvent.PieceDownloaded(index) =>
+      downloadState.update(ds => ds.copy(downloadedPieces = math.max(ds.downloadedPieces, index + 1)))
 
   private def ensureService(resource: Torrent): IO[Unit] = async[IO]:
     val serviceName = serviceNameFor(resource)
@@ -555,7 +601,7 @@ class Processor(client: KClient[IO], supervisor: Supervisor[IO], key: String, na
         "tail",
         "-F",
         "-n",
-        "0",
+        "+1",
         "/var/torrentdam/events.json"
       ).some,
       volumeMounts = Seq(
@@ -615,43 +661,53 @@ end Processor
 
 final class ProcessorRegistry(supervisor: Supervisor[IO], client: KClient[IO], namespace: String)(using logger: Logger[IO]):
 
-  private val processors: Ref[IO, Map[String, Channel[IO, TorrentEvent]]] =
+  private val processors: Ref[IO, Map[String, Processor]] =
     Ref.unsafe(Map.empty)
 
   def getForId(key: String): IO[Channel[IO, TorrentEvent]] =
     processors.get.flatMap { map =>
       map.get(key) match
-        case Some(ch) =>
-          ch.isClosed.flatMap {
-            case false => IO.pure(ch)
+        case Some(p) =>
+          p.channel.isClosed.flatMap {
+            case false => IO.pure(p.channel)
             case true  => spawnProcessor(key)
           }
         case None =>
           spawnProcessor(key)
     }
 
+  def getDownloadState(key: String): IO[Option[DownloadState]] =
+    processors.get.flatMap { map =>
+      map.get(key) match
+        case Some(p) => p.downloadState.get.map(_.some)
+        case None    => IO.pure(None)
+    }
+
   private def spawnProcessor(key: String): IO[Channel[IO, TorrentEvent]] =
     Channel.bounded[IO, TorrentEvent](1024).flatMap { ch =>
-      val processor = Processor(client, supervisor, key, namespace, ch)
-      supervisor.supervise(processor.run).as(ch)
-    }.flatMap { ch =>
-      processors.update(_.updated(key, ch)).as(ch)
+      val processor = Processor(ch, client, supervisor, key, namespace)
+      supervisor.supervise(processor.run).as(processor)
+    }.flatMap { p =>
+      processors.update(_.updated(key, p)).as(p.channel)
     }
 
 end ProcessorRegistry
 
 object OperatorTorrentOps:
-  def apply(client: KClient[IO], namespace: String)(using logger: Logger[IO]): TorrentOps[IO] =
+  def apply(client: KClient[IO], namespace: String, registry: ProcessorRegistry)(using logger: Logger[IO]): TorrentOps[IO] =
     new TorrentOps[IO]:
       def list: IO[List[TorrentInfo]] = async[IO]:
         val torrents = new TorrentAPI(namespace).list().send(client).await
         torrents.items.toList.map { t =>
+          val key = t.metadata.name.getOrElse("")
+          val ds = registry.getDownloadState(key).await
           TorrentInfo(
             name = t.spec.name,
             infoHash = t.spec.infoHash,
             phase = t.status.flatMap(_.phase).getOrElse("Unknown"),
             downloadPath = t.spec.downloadPath,
-            labels = t.spec.labels
+            labels = t.spec.labels,
+            downloadState = ds
           )
         }
 

@@ -6,6 +6,7 @@
 //> using dep dev.hnaderi::scala-k8s-http4s-ember::0.31.0
 //> using dep dev.hnaderi::scala-k8s-circe::0.31.0
 //> using dep org.http4s::http4s-circe::0.23.36
+//> using dep io.circe::circe-parser::0.14.16
 //> using dep org.http4s::http4s-ember-server::0.23.36
 //> using dep org.http4s::http4s-dsl::0.23.36
 //> using dep org.typelevel::cats-effect::3.7.0

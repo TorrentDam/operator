@@ -21,7 +21,8 @@ case class TorrentInfo(
   infoHash: String,
   phase: String,
   downloadPath: Option[String],
-  labels: List[String]
+  labels: List[String],
+  downloadState: Option[DownloadState] = None
 )
 
 trait TorrentOps[F[_]]:
@@ -132,18 +133,25 @@ object TransmissionServer:
     }
 
   private def torrentToJson(t: TorrentInfo, fields: List[String]): Json =
-    val isFinished = t.phase == "Succeeded"
+    val ds = t.downloadState
+    val isFinished = t.phase == "Succeeded" || ds.exists(_.isFinished)
     val path = java.nio.file.Path.of(t.downloadPath.getOrElse("/"))
     val downloadDir = Option(path.getParent).map(_.toString).filter(_.nonEmpty).getOrElse("/")
     val downloadDirAbs = if (downloadDir.startsWith("/")) downloadDir else "/" + downloadDir
-    val name = Option(path.getFileName).map(_.toString).filter(_.nonEmpty).getOrElse(t.name)
+    val name = ds.flatMap(_.name).filter(_.nonEmpty)
+      .orElse(Option(path.getFileName).map(_.toString).filter(_.nonEmpty))
+      .getOrElse(t.name)
+    val totalSize = ds.map(_.totalSize).getOrElse(1L)
+    val leftUntilDone = ds.map(_.leftUntilDone).getOrElse(if isFinished then 0L else 1L)
+    val downloadedEver = ds.map(_.downloadedBytes).getOrElse(0L)
+    val fileCount = ds.map(_ => 1).getOrElse(0)
     val all: Map[String, Json] = Map(
       "id" -> Json.fromInt(t.infoHash.hashCode),
       "hashString" -> Json.fromString(t.infoHash),
       "name" -> Json.fromString(name),
       "downloadDir" -> Json.fromString(downloadDirAbs),
-      "totalSize" -> Json.fromLong(1),
-      "leftUntilDone" -> Json.fromLong(if isFinished then 0 else 1),
+      "totalSize" -> Json.fromLong(totalSize),
+      "leftUntilDone" -> Json.fromLong(leftUntilDone),
       "isFinished" -> Json.fromBoolean(isFinished),
       "eta" -> Json.fromLong(-1),
       "status" -> Json.fromInt(phaseToStatus(t.phase)),
@@ -151,13 +159,13 @@ object TransmissionServer:
       "secondsSeeding" -> Json.fromLong(0),
       "errorString" -> Json.fromString(""),
       "uploadedEver" -> Json.fromLong(0),
-      "downloadedEver" -> Json.fromLong(0),
+      "downloadedEver" -> Json.fromLong(downloadedEver),
       "seedRatioLimit" -> Json.fromDoubleOrNull(0.0),
       "seedRatioMode" -> Json.fromInt(0),
       "seedIdleLimit" -> Json.fromLong(0),
       "seedIdleMode" -> Json.fromInt(0),
-      "fileCount" -> Json.fromInt(0),
-      "file-count" -> Json.fromInt(0),
+      "fileCount" -> Json.fromInt(fileCount),
+      "file-count" -> Json.fromInt(fileCount),
       "labels" -> Json.fromValues(t.labels.map(Json.fromString))
     )
     if fields.isEmpty then Json.fromFields(all.toSeq) else Json.fromFields(fields.flatMap(f => all.get(f).map(f -> _)))
