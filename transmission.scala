@@ -76,6 +76,8 @@ object TransmissionServer:
                 response <- Ok(result)
               yield response
         yield resp
+      case req @ GET -> Root =>
+        Ok("TorrentDam Transmission RPC")
       case req @ GET -> Root / "transmission" / "rpc" =>
         val sid = UUID.randomUUID().toString
         Logger[IO].debug(s"GET /transmission/rpc, returning 409 with $sid") *>
