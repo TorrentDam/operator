@@ -183,6 +183,7 @@ object TransmissionServer:
           .map(_.toString.trim)
           .filter(_.nonEmpty)
           .getOrElse(m.infoHash.toLowerCase)
+          .replace(":", "_")
         val clientDir = arguments.hcursor.get[String]("download-dir").toOption
           .filter(_.nonEmpty)
         val labels = arguments.hcursor.get[List[String]]("labels").getOrElse(Nil)
