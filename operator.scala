@@ -344,13 +344,14 @@ class Processor(val channel: Channel[IO, TorrentEvent], client: KClient[IO], sup
 
   private def onTorrentDeletion(resource: Torrent): IO[Unit] = async[IO]:
     val crName = resource.metadata.name.getOrElse("")
+    val name = resource.spec.name
     deleteTorrentPod(resource).await
     deleteTorrentService(resource).await
     resource.spec.downloadPath match
       case Some(downloadPath) if downloadPath.nonEmpty =>
-        Logger[IO].info(s"Cleaning up PVC path /data/$downloadPath for torrent $crName").await
+        Logger[IO].info(s"Cleaning up PVC path /data/$downloadPath/$name for torrent $crName").await
         waitForTorrentPodTermination(resource).await
-        val target = Path("/data") / downloadPath
+        val target = Path("/data") / downloadPath / name
         Files[IO].exists(target).flatMap(exists =>
           if exists then Files[IO].deleteRecursively(target)
           else Logger[IO].debug(s"$target already gone")
@@ -551,6 +552,7 @@ class Processor(val channel: Channel[IO, TorrentEvent], client: KClient[IO], sup
 
   private def getPod(resource: Torrent): Pod =
     val downloadPath = resource.spec.downloadPath.getOrElse("")
+    val name = resource.spec.name
     val baseContainer = Container(
       name = "torrentdam",
       image = "ghcr.io/torrentdam/cmd:latest".some,
@@ -564,7 +566,7 @@ class Processor(val channel: Channel[IO, TorrentEvent], client: KClient[IO], sup
         "--events",
         "/var/torrentdam/events.json"
       ).some,
-      workingDir = (Path("/data") / downloadPath).toString.some,
+      workingDir = (Path("/data") / downloadPath / name).toString.some,
       env = Seq(
         EnvVar(
           name = "INFO_HASH",

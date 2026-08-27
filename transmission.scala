@@ -135,12 +135,8 @@ object TransmissionServer:
   private def torrentToJson(t: TorrentInfo, fields: List[String]): Json =
     val ds = t.downloadState
     val isFinished = t.phase == "Succeeded" || ds.exists(_.isFinished)
-    val path = java.nio.file.Path.of(t.downloadPath.getOrElse("/"))
-    val downloadDir = Option(path.getParent).map(_.toString).filter(_.nonEmpty).getOrElse("/")
+    val downloadDir = t.downloadPath.filter(_.nonEmpty).getOrElse("/")
     val downloadDirAbs = if (downloadDir.startsWith("/")) downloadDir else "/" + downloadDir
-    val name = ds.flatMap(_.name).filter(_.nonEmpty)
-      .orElse(Option(path.getFileName).map(_.toString).filter(_.nonEmpty))
-      .getOrElse(t.name)
     val totalSize = ds.map(_.totalSize).getOrElse(1L)
     val leftUntilDone = ds.map(_.leftUntilDone).getOrElse(if isFinished then 0L else 1L)
     val downloadedEver = ds.map(_.downloadedBytes).getOrElse(0L)
@@ -148,7 +144,7 @@ object TransmissionServer:
     val all: Map[String, Json] = Map(
       "id" -> Json.fromInt(t.infoHash.hashCode),
       "hashString" -> Json.fromString(t.infoHash),
-      "name" -> Json.fromString(name),
+      "name" -> Json.fromString(t.name),
       "downloadDir" -> Json.fromString(downloadDirAbs),
       "totalSize" -> Json.fromLong(totalSize),
       "leftUntilDone" -> Json.fromLong(leftUntilDone),
@@ -190,8 +186,7 @@ object TransmissionServer:
         val clientDir = arguments.hcursor.get[String]("download-dir").toOption
           .filter(_.nonEmpty)
         val labels = arguments.hcursor.get[List[String]]("labels").getOrElse(Nil)
-        val downloadPath = clientDir.map(dir => s"$dir/$segment").getOrElse(s"/$segment")
-        ops.create(m.infoHash, segment, Some(downloadPath), labels).as(
+        ops.create(m.infoHash, segment, clientDir, labels).as(
           Json.obj(
             "result" -> Json.fromString("success"),
             "arguments" -> Json.obj(
